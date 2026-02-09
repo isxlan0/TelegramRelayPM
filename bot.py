@@ -1,14 +1,22 @@
-import asyncio
+﻿import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
-from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatType
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -77,6 +85,11 @@ class RelayDB:
             CREATE TABLE IF NOT EXISTS admin_state (
                 admin_chat_id INTEGER PRIMARY KEY,
                 current_session_user_id INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                banned_at TEXT NOT NULL
             );
             """
         )
@@ -235,6 +248,28 @@ class RelayDB:
             return None
         return row["current_session_user_id"]
 
+    def ban_user(self, user_id: int) -> None:
+        self.conn.execute(
+            """
+            INSERT OR REPLACE INTO banned_users (user_id, banned_at)
+            VALUES (?, ?)
+            """,
+            (user_id, utc_now_iso()),
+        )
+        self.conn.commit()
+
+    def unban_user(self, user_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def is_user_banned(self, user_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM banned_users WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return bool(row)
+
     def delete_mappings_by_admin_message(self, admin_chat_id: int, admin_message_id: int) -> int:
         cur = self.conn.execute(
             """
@@ -255,6 +290,40 @@ def is_admin_chat(update: Update) -> bool:
 
 def get_db(context: ContextTypes.DEFAULT_TYPE) -> RelayDB:
     return context.application.bot_data["db"]
+
+
+def resolve_target_user_from_arg_or_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db: RelayDB,
+) -> Optional[int]:
+    if context.args:
+        try:
+            return int(context.args[0])
+        except ValueError:
+            return None
+    if update.message and update.message.reply_to_message:
+        return db.get_target_user_by_admin_message(
+            config.ADMIN_CHAT_ID, update.message.reply_to_message.message_id
+        )
+    return None
+
+
+def admin_action_keyboard(user_id: int, admin_message_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("封禁用户", callback_data=f"ban:{user_id}"),
+            InlineKeyboardButton("解封用户", callback_data=f"unban:{user_id}"),
+            InlineKeyboardButton("设为会话", callback_data=f"sess:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("清空会话", callback_data="sessclear"),
+            InlineKeyboardButton("用户ID", callback_data=f"uid:{user_id}"),
+        ],
+    ]
+    if admin_message_id is not None:
+        rows.append([InlineKeyboardButton("删除消息", callback_data=f"delpair:{admin_message_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -330,8 +399,124 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("用法：/session <用户ID> 或 /session clear")
         return
 
+    if db.is_user_banned(target_user_id):
+        await update.message.reply_text(f"用户 {target_user_id} 已封禁，不能设为当前会话。")
+        return
+
     db.set_current_session(config.ADMIN_CHAT_ID, target_user_id)
     await update.message.reply_text(f"当前会话已切换到用户：{target_user_id}")
+
+
+async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin_chat(update):
+        await update.message.reply_text("无权限。")
+        return
+    db = get_db(context)
+    target_user_id = resolve_target_user_from_arg_or_reply(update, context, db)
+    if not target_user_id:
+        await update.message.reply_text("用法：/ban <用户ID>，或回复用户转发消息后发送 /ban")
+        return
+
+    already_banned = db.is_user_banned(target_user_id)
+    if not already_banned:
+        db.ban_user(target_user_id)
+        if db.get_current_session(config.ADMIN_CHAT_ID) == target_user_id:
+            db.set_current_session(config.ADMIN_CHAT_ID, None)
+    await update.message.reply_text(
+        f"用户 {target_user_id} 已封禁。" if not already_banned else f"用户 {target_user_id} 已经是封禁状态。"
+    )
+
+
+async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin_chat(update):
+        await update.message.reply_text("无权限。")
+        return
+    db = get_db(context)
+    target_user_id = resolve_target_user_from_arg_or_reply(update, context, db)
+    if not target_user_id:
+        await update.message.reply_text("用法：/unban <用户ID>，或回复用户转发消息后发送 /unban")
+        return
+
+    removed = db.unban_user(target_user_id)
+    await update.message.reply_text(
+        f"用户 {target_user_id} 已解封。" if removed else f"用户 {target_user_id} 当前不在封禁列表。"
+    )
+
+
+async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not is_admin_chat(update):
+        await query.answer("无权限", show_alert=True)
+        return
+
+    db = get_db(context)
+    if query.data == "sessclear":
+        db.set_current_session(config.ADMIN_CHAT_ID, None)
+        await query.answer("已清空当前会话")
+        return
+
+    try:
+        action, target_id_text = query.data.split(":", 1)
+        target_id = int(target_id_text)
+    except ValueError:
+        await query.answer("无效操作")
+        return
+
+    if action == "sess":
+        if db.is_user_banned(target_id):
+            await query.answer("该用户已封禁，不能设为会话", show_alert=True)
+            return
+        db.set_current_session(config.ADMIN_CHAT_ID, target_id)
+        await query.answer(f"当前会话已切换到 {target_id}")
+        return
+
+    if action == "ban":
+        already_banned = db.is_user_banned(target_id)
+        if not already_banned:
+            db.ban_user(target_id)
+            if db.get_current_session(config.ADMIN_CHAT_ID) == target_id:
+                db.set_current_session(config.ADMIN_CHAT_ID, None)
+        await query.answer("已封禁该用户" if not already_banned else "该用户已封禁")
+        return
+
+    if action == "unban":
+        removed = db.unban_user(target_id)
+        await query.answer("已解封该用户" if removed else "该用户当前不在封禁列表")
+        return
+
+    if action == "uid":
+        await query.answer(f"用户 ID: {target_id}", show_alert=True)
+        return
+
+    if action == "delpair":
+        mappings = db.get_maps_by_admin_message(config.ADMIN_CHAT_ID, target_id)
+        if not mappings:
+            await query.answer("没有可删除的消息")
+            return
+        deleted = 0
+        failed = 0
+        for row in mappings:
+            try:
+                await context.bot.delete_message(config.ADMIN_CHAT_ID, row["admin_message_id"])
+                deleted += 1
+            except (BadRequest, Forbidden, TelegramError):
+                failed += 1
+            try:
+                await context.bot.delete_message(row["user_chat_id"], row["user_message_id"])
+                deleted += 1
+            except (BadRequest, Forbidden, TelegramError):
+                failed += 1
+        db.delete_mappings_by_admin_message(config.ADMIN_CHAT_ID, target_id)
+        await query.answer(f"删除完成 成功{deleted} 失败{failed}")
+        return
+
+    await query.answer("未知操作")
 
 
 async def sender_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,13 +594,13 @@ async def delete_pair_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     reply = update.message.reply_to_message
     if not reply:
-        await update.message.reply_text("请回复一条映射消息后执行 /deletepair")
+        await update.message.reply_text("请回复一条消息后执行 /deletepair")
         return
 
     db = get_db(context)
     mappings = db.get_maps_by_admin_message(config.ADMIN_CHAT_ID, reply.message_id)
     if not mappings:
-        await update.message.reply_text("没有找到可删除的映射。")
+        await update.message.reply_text("没有找到可删除的消息。")
         return
 
     deleted = 0
@@ -452,6 +637,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     db.touch_user(user.id, user.username, user.full_name)
+    if db.is_user_banned(user.id):
+        await msg.reply_text("你已被管理员封禁，消息不会被转发。")
+        return
 
     user_card = (
         "来自用户的新消息\n"
@@ -459,7 +647,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         f"ID：{user.id}\n"
         "内容：见下方转发消息"
     )
-    await context.bot.send_message(chat_id=config.ADMIN_CHAT_ID, text=user_card)
+    user_card_msg = await context.bot.send_message(chat_id=config.ADMIN_CHAT_ID, text=user_card)
 
     try:
         forwarded = await context.bot.forward_message(
@@ -479,6 +667,11 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         admin_message_id=forwarded.message_id,
         direction="user_to_admin",
     )
+    await context.bot.edit_message_reply_markup(
+        chat_id=config.ADMIN_CHAT_ID,
+        message_id=user_card_msg.message_id,
+        reply_markup=admin_action_keyboard(user.id, forwarded.message_id),
+    )
 
 
 async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -497,6 +690,9 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not target_user_id:
         await msg.reply_text("请回复一条用户转发消息，或先用 /session <用户ID> 设定当前会话。")
+        return
+    if db.is_user_banned(target_user_id):
+        await msg.reply_text(f"用户 {target_user_id} 已封禁，消息未发送。")
         return
 
     try:
@@ -699,9 +895,17 @@ def main() -> None:
     app.add_handler(CommandHandler("id", id_cmd))
     app.add_handler(CommandHandler("recent", recent_cmd))
     app.add_handler(CommandHandler("session", session_cmd))
+    app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("unban", unban_cmd))
     app.add_handler(CommandHandler("sender", sender_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("deletepair", delete_pair_cmd))
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_action_callback,
+            pattern=r"^(?:sessclear|(?:ban|unban|sess|uid|delpair):\d+)$",
+        )
+    )
 
     app.add_handler(
         MessageHandler(

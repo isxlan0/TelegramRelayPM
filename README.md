@@ -77,7 +77,7 @@ BOT_NAME="双向中继机器人"
 BOT_DESCRIPTION="这是一个双向消息中继机器人。\n当双方无法直接私聊时，可通过本机器人转发消息。"
 BOT_SHORT_DESCRIPTION="双向消息中继"
 BOT_USER_COMMANDS="start:查看公告与说明;id:查看你的用户ID"
-BOT_ADMIN_COMMANDS="start:查看公告与说明;id:查看你的用户ID;recent:管理员查看最近活跃用户;session:管理员切换当前会话;sender:管理员获取发送者ID;broadcast:管理员广播消息;deletepair:管理员删除映射消息对"
+BOT_ADMIN_COMMANDS="start:查看公告与说明;id:查看你的用户ID;recent:管理员查看最近活跃用户;session:管理员切换当前会话;ban:管理员封禁用户;unban:管理员解封用户;sender:管理员获取发送者ID;broadcast:管理员广播消息;deletepair:管理员删除映射消息对"
 ```
 
 说明：
@@ -107,6 +107,8 @@ python bot.py
 - `/session <user_id>` 设置当前会话用户
 - `/session clear` 清空当前会话
 - `/session` 查看当前会话
+- `/ban <user_id>` 或回复转发消息后 `/ban`，封禁用户（不再转发）
+- `/unban <user_id>` 或回复转发消息后 `/unban`，解封用户
 - `/sender` 回复一条转发消息，查询发送者 ID
 - `/broadcast` 广播（回复消息优先；无回复时支持 `/broadcast 你好`）
 - `/deletepair` 回复映射消息，删除双方对应消息
