@@ -4,6 +4,7 @@ import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 from telegram import (
@@ -30,6 +31,7 @@ import config
 MAX_BOT_NAME_LEN = 64
 MAX_BOT_DESCRIPTION_LEN = 512
 MAX_BOT_SHORT_DESCRIPTION_LEN = 120
+PENDING_INPUT_TIMEOUT_SECONDS = 180
 
 
 def utc_now_iso() -> str:
@@ -949,8 +951,20 @@ def parse_rule_add_payload(raw: str) -> Optional[Tuple[str, str, str]]:
 
     if " " not in left:
         return None
-    trigger_type, trigger_text = left.split(" ", 1)
-    trigger_type = trigger_type.strip().lower()
+    trigger_type_raw, trigger_text = left.split(" ", 1)
+    trigger_type = trigger_type_raw.strip().lower()
+    trigger_type_aliases = {
+        "exact": "exact",
+        "精确": "exact",
+        "精准": "exact",
+        "contains": "contains",
+        "包含": "contains",
+        "prefix": "prefix",
+        "前缀": "prefix",
+        "regex": "regex",
+        "正则": "regex",
+    }
+    trigger_type = trigger_type_aliases.get(trigger_type, "")
     trigger_text = trigger_text.strip()
     if trigger_type not in {"exact", "contains", "prefix", "regex"}:
         return None
@@ -1015,14 +1029,291 @@ def admin_action_keyboard(user_id: int, admin_message_id: Optional[int] = None) 
     return InlineKeyboardMarkup(rows)
 
 
+def two_column_rows(buttons: List[InlineKeyboardButton]) -> List[List[InlineKeyboardButton]]:
+    rows: List[List[InlineKeyboardButton]] = []
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i : i + 2])
+    return rows
+
+
+def home_menu_button_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("返回主菜单", callback_data="menu:home")]])
+
+
+def start_commands_keyboard(command_pairs: List[Tuple[str, str]], is_admin: bool) -> InlineKeyboardMarkup:
+    buttons: List[InlineKeyboardButton] = []
+    existing_commands = set()
+    for command, desc in command_pairs:
+        command_lower = command.strip().lower()
+        if command_lower == "start":
+            continue
+        if command_lower in {"id", "version", "chatid", "banlist", "sender", "deletepair"}:
+            callback_data = f"do:{command_lower}"
+        elif command_lower == "stats":
+            callback_data = "menu:stats"
+        elif command_lower == "rule":
+            callback_data = "menu:rule"
+        else:
+            callback_data = f"ask:{command_lower}"
+        buttons.append(InlineKeyboardButton(desc.strip() or f"/{command_lower}", callback_data=callback_data))
+        existing_commands.add(command_lower)
+
+    if is_admin:
+        if "stats" not in existing_commands:
+            buttons.append(InlineKeyboardButton("统计快捷", callback_data="menu:stats"))
+        if "rule" not in existing_commands:
+            buttons.append(InlineKeyboardButton("规则菜单", callback_data="menu:rule"))
+
+    rows = two_column_rows(buttons)
+    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("我的ID", callback_data="do:id")]])
+
+
+def stats_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = two_column_rows(
+        [
+            InlineKeyboardButton("24小时", callback_data="do:stats:24h"),
+            InlineKeyboardButton("7天", callback_data="do:stats:7d"),
+            InlineKeyboardButton("30天", callback_data="do:stats:30d"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("返回主菜单", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def rule_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = two_column_rows(
+        [
+            InlineKeyboardButton("查看规则", callback_data="do:rule:list"),
+            InlineKeyboardButton("添加规则", callback_data="menu:ruleaddtype"),
+            InlineKeyboardButton("启用规则", callback_data="menu:ruleon"),
+            InlineKeyboardButton("停用规则", callback_data="menu:ruleoff"),
+            InlineKeyboardButton("删除规则", callback_data="menu:ruledel"),
+            InlineKeyboardButton("测试规则", callback_data="ask:rule:test"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("返回主菜单", callback_data="menu:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def rule_select_keyboard(rows, action: str) -> InlineKeyboardMarkup:
+    buttons: List[InlineKeyboardButton] = []
+    for row in rows:
+        rule_id = int(row["id"])
+        trigger_type = str(row["trigger_type"])
+        trigger_text = str(row["trigger_text"])
+        status_text = "启用" if int(row["is_enabled"]) else "停用"
+        short_text = trigger_text if len(trigger_text) <= 10 else f"{trigger_text[:9]}…"
+        buttons.append(
+            InlineKeyboardButton(
+                f"#{rule_id} [{status_text}] [{trigger_type}] {short_text}",
+                callback_data=f"do:ruleop:{action}:{rule_id}",
+            )
+        )
+
+    menu_rows = two_column_rows(buttons)
+    menu_rows.append([InlineKeyboardButton("返回规则菜单", callback_data="menu:rule")])
+    return InlineKeyboardMarkup(menu_rows)
+
+
+def rule_add_type_keyboard() -> InlineKeyboardMarkup:
+    rows = two_column_rows(
+        [
+            InlineKeyboardButton("精确", callback_data="ask:rule:add:exact"),
+            InlineKeyboardButton("包含", callback_data="ask:rule:add:contains"),
+            InlineKeyboardButton("前缀", callback_data="ask:rule:add:prefix"),
+            InlineKeyboardButton("正则", callback_data="ask:rule:add:regex"),
+        ]
+    )
+    rows.append([InlineKeyboardButton("返回规则菜单", callback_data="menu:rule")])
+    return InlineKeyboardMarkup(rows)
+
+
+def pending_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("取消输入", callback_data="do:cancel"),
+                InlineKeyboardButton("返回主菜单", callback_data="menu:home"),
+            ]
+        ]
+    )
+
+
+def set_pending_input(context: ContextTypes.DEFAULT_TYPE, key: str, origin_chat_id: int) -> None:
+    context.user_data["pending_input"] = {
+        "key": key,
+        "origin_chat_id": origin_chat_id,
+        "created_at": datetime.now(timezone.utc).timestamp(),
+    }
+
+
+def clear_pending_input(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("pending_input", None)
+
+
+def get_pending_input(context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
+    pending = context.user_data.get("pending_input")
+    if not isinstance(pending, dict):
+        return None
+    return pending
+
+
+def pending_is_expired(pending: dict) -> bool:
+    created_at = pending.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        return True
+    return (datetime.now(timezone.utc).timestamp() - created_at) > PENDING_INPUT_TIMEOUT_SECONDS
+
+
+def parse_guided_args(action_key: str, text: str) -> Optional[List[str]]:
+    raw = text.strip()
+    if not raw:
+        return None
+
+    if action_key == "recent":
+        return [raw]
+    if action_key == "session":
+        return [raw]
+    if action_key == "ban":
+        return raw.split()
+    if action_key in {"baninfo", "unban"}:
+        return [raw]
+    if action_key == "broadcast":
+        return [raw]
+    if action_key.startswith("rule:add:"):
+        rule_type = action_key.split(":", 2)[2].strip().lower()
+        if rule_type not in {"exact", "contains", "prefix", "regex"}:
+            return None
+        if "=>" not in raw:
+            return None
+        return ["add", f"{rule_type} {raw}"]
+    if action_key == "rule:add":
+        return ["add", raw]
+    if action_key == "rule:on":
+        return ["on", raw]
+    if action_key == "rule:off":
+        return ["off", raw]
+    if action_key == "rule:del":
+        return ["del", raw]
+    if action_key == "rule:test":
+        return ["test", raw]
+    return None
+
+
+def guided_prompt(action_key: str) -> str:
+    prompts = {
+        "recent": "请输入数量 N（1-100），例如：10",
+        "session": "请输入用户ID，或输入 clear 清空当前会话。",
+        "ban": "请输入封禁参数：<用户ID> [1h|1d|7d|30d|YYYY-MM-DD] [原因]，备注用 | 分隔。",
+        "baninfo": "请输入要查询的用户ID。",
+        "unban": "请输入要解封的用户ID。",
+        "broadcast": "请输入广播内容（下一条消息将作为广播文本）。",
+        "rule:add": "请输入：<精确|包含|前缀|正则> <触发词> => <回复内容>（也兼容 exact|contains|prefix|regex）",
+        "rule:add:exact": "已选择【精确】。请输入：触发词=>回复内容，例如：你好=>你好呀",
+        "rule:add:contains": "已选择【包含】。请输入：触发词=>回复内容，例如：你好=>你好呀",
+        "rule:add:prefix": "已选择【前缀】。请输入：触发词=>回复内容，例如：你好=>你好呀",
+        "rule:add:regex": "已选择【正则】。请输入：触发词=>回复内容，例如：^你好.*=>你好呀",
+        "rule:on": "请输入要启用的规则ID。",
+        "rule:off": "请输入要停用的规则ID。",
+        "rule:del": "请输入要删除的规则ID。",
+        "rule:test": "请输入要测试匹配的文本。",
+    }
+    return prompts.get(action_key, "请输入参数。")
+
+
+async def run_command_with_args(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    handler,
+    args: Optional[List[str]] = None,
+) -> None:
+    old_args = getattr(context, "args", None)
+    context.args = args or []
+    try:
+        await handler(update, context)
+    finally:
+        context.args = old_args
+
+
+async def consume_pending_input_if_any(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not update.message or update.message.text is None or not update.effective_chat:
+        return False
+
+    pending = get_pending_input(context)
+    if not pending:
+        return False
+
+    if pending_is_expired(pending):
+        clear_pending_input(context)
+        await update.message.reply_text("输入已超时，请重新点击菜单按钮。")
+        return True
+
+    if int(pending.get("origin_chat_id", 0)) != update.effective_chat.id:
+        return False
+
+    action_key = str(pending.get("key", "")).strip()
+    if not action_key:
+        clear_pending_input(context)
+        return False
+
+    args = parse_guided_args(action_key, update.message.text)
+    if args is None:
+        await update.message.reply_text(
+            f"输入格式不正确。{guided_prompt(action_key)}",
+            reply_markup=pending_cancel_keyboard(),
+        )
+        return True
+
+    clear_pending_input(context)
+
+    command_handler_map = {
+        "recent": recent_cmd,
+        "session": session_cmd,
+        "ban": ban_cmd,
+        "baninfo": baninfo_cmd,
+        "unban": unban_cmd,
+        "broadcast": broadcast_cmd,
+        "rule:add": rule_cmd,
+        "rule:add:exact": rule_cmd,
+        "rule:add:contains": rule_cmd,
+        "rule:add:prefix": rule_cmd,
+        "rule:add:regex": rule_cmd,
+        "rule:on": rule_cmd,
+        "rule:off": rule_cmd,
+        "rule:del": rule_cmd,
+        "rule:test": rule_cmd,
+    }
+    handler = command_handler_map.get(action_key)
+    if handler is None:
+        await update.message.reply_text("未知引导动作，已取消。")
+        return True
+
+    await run_command_with_args(update, context, handler, args)
+    return True
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not update.message:
+    if not update.effective_user or not update.message or not update.effective_chat:
         return
     db = get_db(context)
     user = update.effective_user
-    if not is_admin_user(update):
+    is_admin = is_admin_user(update)
+
+    if not is_admin:
         db.touch_user(user.id, user.username, user.full_name)
-    await update.message.reply_text(config.START_MESSAGE or "已连接中继机器人。发送 /id 查看你的 Telegram 用户 ID。")
+
+    clear_pending_input(context)
+
+    show_menu = update.effective_chat.type == ChatType.PRIVATE
+    if not show_menu and is_admin and config.RELAY_MODE == "group_topic" and config.ADMIN_GROUP_CHAT_ID is not None:
+        show_menu = update.effective_chat.id == config.ADMIN_GROUP_CHAT_ID
+
+    command_pairs = config.BOT_ADMIN_COMMANDS if is_admin else config.BOT_USER_COMMANDS
+    reply_markup = start_commands_keyboard(command_pairs, is_admin) if show_menu else None
+    await update.message.reply_text(
+        config.START_MESSAGE or "已连接中继机器人。发送 /id 查看你的 Telegram 用户 ID。",
+        reply_markup=reply_markup,
+    )
 
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1284,6 +1575,172 @@ async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    data = query.data
+    is_admin = is_admin_user(update)
+
+    if data.startswith("menu:"):
+        target = data.split(":", 1)[1]
+        if target == "stats":
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            await query.edit_message_reply_markup(reply_markup=stats_menu_keyboard())
+            await query.answer()
+            return
+        if target == "rule":
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            await query.edit_message_reply_markup(reply_markup=rule_menu_keyboard())
+            await query.answer()
+            return
+        if target == "ruleaddtype":
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            await query.edit_message_reply_markup(reply_markup=rule_add_type_keyboard())
+            await query.answer()
+            return
+        if target in {"ruleon", "ruleoff", "ruledel"}:
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            if not query.message:
+                await query.answer("无法获取会话上下文", show_alert=True)
+                return
+            db = get_db(context)
+            rows = db.list_auto_reply_rules(50)
+            if not rows:
+                await query.answer("暂无规则", show_alert=True)
+                return
+            action = {"ruleon": "on", "ruleoff": "off", "ruledel": "del"}[target]
+            title = {"on": "请选择要启用的规则", "off": "请选择要停用的规则", "del": "请选择要删除的规则"}[action]
+            await query.message.reply_text(title, reply_markup=rule_select_keyboard(rows, action))
+            await query.answer()
+            return
+        if target == "home":
+            command_pairs = config.BOT_ADMIN_COMMANDS if is_admin else config.BOT_USER_COMMANDS
+            await query.edit_message_reply_markup(
+                reply_markup=start_commands_keyboard(command_pairs, is_admin)
+            )
+            await query.answer()
+            return
+        await query.answer("未知菜单")
+        return
+
+    if data == "do:cancel":
+        clear_pending_input(context)
+        await query.answer("已取消输入")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        return
+
+    if data.startswith("ask:"):
+        if not query.message or not query.message.chat:
+            await query.answer("无法获取会话上下文", show_alert=True)
+            return
+        action_key = data.split(":", 1)[1]
+        admin_required = {
+            "recent",
+            "session",
+            "ban",
+            "baninfo",
+            "unban",
+            "broadcast",
+            "rule:add",
+            "rule:on",
+            "rule:off",
+            "rule:del",
+            "rule:test",
+        }
+        needs_admin = action_key in admin_required or action_key.startswith("rule:add:")
+        if needs_admin and not is_admin:
+            await query.answer("无权限", show_alert=True)
+            return
+
+        set_pending_input(context, action_key, query.message.chat.id)
+        await query.message.reply_text(guided_prompt(action_key), reply_markup=pending_cancel_keyboard())
+        await query.answer("请按提示输入")
+        return
+
+    if data.startswith("do:"):
+        if not query.message or not update.effective_user:
+            await query.answer("无法执行", show_alert=True)
+            return
+
+        payload = data.split(":")
+        command = payload[1]
+        pseudo_update = SimpleNamespace(
+            message=query.message,
+            effective_user=update.effective_user,
+            effective_chat=query.message.chat,
+            callback_query=update.callback_query,
+        )
+
+        if command in {"id", "version", "chatid"}:
+            handler = {"id": id_cmd, "version": version_cmd, "chatid": chatid_cmd}[command]
+            await run_command_with_args(pseudo_update, context, handler, [])
+            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
+            await query.answer()
+            return
+
+        if command == "banlist":
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            await run_command_with_args(pseudo_update, context, banlist_cmd, [])
+            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
+            await query.answer()
+            return
+
+        if command == "rule" and len(payload) >= 3 and payload[2] == "list":
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            await run_command_with_args(pseudo_update, context, rule_cmd, ["list"])
+            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
+            await query.answer()
+            return
+
+        if command == "ruleop" and len(payload) >= 4:
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            sub = payload[2]
+            rule_id = payload[3]
+            if sub not in {"on", "off", "del"}:
+                await query.answer("未知规则操作", show_alert=True)
+                return
+            await run_command_with_args(pseudo_update, context, rule_cmd, [sub, rule_id])
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("规则菜单", callback_data="menu:rule"), InlineKeyboardButton("返回主菜单", callback_data="menu:home")]]
+                )
+            )
+            await query.answer()
+            return
+
+        if command == "stats" and len(payload) >= 3:
+            if not is_admin:
+                await query.answer("无权限", show_alert=True)
+                return
+            window = payload[2]
+            await run_command_with_args(pseudo_update, context, stats_cmd, [window])
+            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
+            await query.answer()
+            return
+
+        await query.answer("该按钮暂不支持直接执行")
+        return
+
+
 async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
@@ -1440,7 +1897,7 @@ async def rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "用法：\n"
             "/rule list\n"
-            "/rule add <exact|contains|prefix|regex> <触发词> => <回复内容>\n"
+            "/rule add <精确|包含|前缀|正则> <触发词> => <回复内容>（也兼容 exact|contains|prefix|regex）\n"
             "/rule on <id> | /rule off <id> | /rule del <id>\n"
             "/rule test <文本>"
         )
@@ -1466,7 +1923,7 @@ async def rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parsed = parse_rule_add_payload(payload)
         if not parsed:
             await update.message.reply_text(
-                "格式错误。用法：/rule add <exact|contains|prefix|regex> <触发词> => <回复内容>"
+                "格式错误。用法：/rule add <精确|包含|前缀|正则> <触发词> => <回复内容>（也兼容 exact|contains|prefix|regex）"
             )
             return
         trigger_type, trigger_text, reply_text = parsed
@@ -1708,6 +2165,9 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     if not msg or not update.effective_user or not update.effective_chat:
         return
     if update.effective_chat.type != ChatType.PRIVATE:
+        return
+
+    if await consume_pending_input_if_any(update, context):
         return
 
     db = get_db(context)
@@ -2147,6 +2607,8 @@ async def private_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         and update.effective_chat.id == config.ADMIN_GROUP_CHAT_ID
     ):
         if is_admin_user(update):
+            if await consume_pending_input_if_any(update, context):
+                return
             await handle_admin_message(update, context)
         return
 
@@ -2315,6 +2777,12 @@ def main() -> None:
     app.add_handler(CommandHandler("sender", sender_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("deletepair", delete_pair_cmd))
+    app.add_handler(
+        CallbackQueryHandler(
+            start_menu_callback,
+            pattern=r"^(?:menu|do|ask):",
+        )
+    )
     app.add_handler(
         CallbackQueryHandler(
             admin_action_callback,
