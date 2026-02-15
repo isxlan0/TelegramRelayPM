@@ -1,6 +1,7 @@
 ﻿import asyncio
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -51,11 +52,13 @@ class RelayDB:
     def __init__(self, db_path: str) -> None:
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
         self._init_schema()
 
     def _init_schema(self) -> None:
-        self.conn.executescript(
-            """
+        with self.lock:
+            self.conn.executescript(
+                """
             PRAGMA journal_mode=WAL;
 
             CREATE TABLE IF NOT EXISTS users (
@@ -92,23 +95,24 @@ class RelayDB:
                 banned_at TEXT NOT NULL
             );
             """
-        )
-        self.conn.commit()
+            )
+            self.conn.commit()
 
     def touch_user(self, user_id: int, username: Optional[str], full_name: str) -> None:
         now = utc_now_iso()
-        self.conn.execute(
-            """
-            INSERT INTO users (user_id, username, full_name, first_seen_at, last_active_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                full_name=excluded.full_name,
-                last_active_at=excluded.last_active_at
-            """,
-            (user_id, username, full_name, now, now),
-        )
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO users (user_id, username, full_name, first_seen_at, last_active_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    full_name=excluded.full_name,
+                    last_active_at=excluded.last_active_at
+                """,
+                (user_id, username, full_name, now, now),
+            )
+            self.conn.commit()
 
     def save_mapping(
         self,
@@ -118,174 +122,187 @@ class RelayDB:
         admin_message_id: int,
         direction: str,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO message_map (
-                user_chat_id, admin_chat_id, user_message_id, admin_message_id, direction, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_chat_id,
-                admin_chat_id,
-                user_message_id,
-                admin_message_id,
-                direction,
-                utc_now_iso(),
-            ),
-        )
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO message_map (
+                    user_chat_id, admin_chat_id, user_message_id, admin_message_id, direction, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_chat_id,
+                    admin_chat_id,
+                    user_message_id,
+                    admin_message_id,
+                    direction,
+                    utc_now_iso(),
+                ),
+            )
+            self.conn.commit()
 
     def get_target_user_by_admin_message(
         self, admin_chat_id: int, admin_message_id: int
     ) -> Optional[int]:
-        row = self.conn.execute(
-            """
-            SELECT user_chat_id
-            FROM message_map
-            WHERE admin_chat_id = ? AND admin_message_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (admin_chat_id, admin_message_id),
-        ).fetchone()
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT user_chat_id
+                FROM message_map
+                WHERE admin_chat_id = ? AND admin_message_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (admin_chat_id, admin_message_id),
+            ).fetchone()
         return int(row["user_chat_id"]) if row else None
 
     def get_user_to_admin_map(
         self, user_chat_id: int, user_message_id: int
     ) -> Optional[sqlite3.Row]:
-        return self.conn.execute(
-            """
-            SELECT *
-            FROM message_map
-            WHERE user_chat_id = ?
-              AND user_message_id = ?
-              AND direction = 'user_to_admin'
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (user_chat_id, user_message_id),
-        ).fetchone()
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM message_map
+                WHERE user_chat_id = ?
+                  AND user_message_id = ?
+                  AND direction = 'user_to_admin'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user_chat_id, user_message_id),
+            ).fetchone()
 
     def get_admin_to_user_maps(self, admin_chat_id: int, admin_message_id: int):
-        return self.conn.execute(
-            """
-            SELECT *
-            FROM message_map
-            WHERE admin_chat_id = ?
-              AND admin_message_id = ?
-              AND direction IN ('admin_to_user', 'broadcast')
-            ORDER BY id DESC
-            """,
-            (admin_chat_id, admin_message_id),
-        ).fetchall()
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM message_map
+                WHERE admin_chat_id = ?
+                  AND admin_message_id = ?
+                  AND direction IN ('admin_to_user', 'broadcast')
+                ORDER BY id DESC
+                """,
+                (admin_chat_id, admin_message_id),
+            ).fetchall()
 
     def get_maps_by_admin_message(self, admin_chat_id: int, admin_message_id: int):
-        return self.conn.execute(
-            """
-            SELECT *
-            FROM message_map
-            WHERE admin_chat_id = ?
-              AND admin_message_id = ?
-            ORDER BY id DESC
-            """,
-            (admin_chat_id, admin_message_id),
-        ).fetchall()
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM message_map
+                WHERE admin_chat_id = ?
+                  AND admin_message_id = ?
+                ORDER BY id DESC
+                """,
+                (admin_chat_id, admin_message_id),
+            ).fetchall()
 
     def get_recent_users(self, limit_count: int, exclude_user_id: Optional[int] = None):
-        if exclude_user_id is None:
+        with self.lock:
+            if exclude_user_id is None:
+                return self.conn.execute(
+                    """
+                    SELECT user_id, username, full_name, last_active_at
+                    FROM users
+                    ORDER BY last_active_at DESC
+                    LIMIT ?
+                    """,
+                    (limit_count,),
+                ).fetchall()
             return self.conn.execute(
                 """
                 SELECT user_id, username, full_name, last_active_at
                 FROM users
+                WHERE user_id != ?
                 ORDER BY last_active_at DESC
                 LIMIT ?
                 """,
-                (limit_count,),
+                (exclude_user_id, limit_count),
             ).fetchall()
-        return self.conn.execute(
-            """
-            SELECT user_id, username, full_name, last_active_at
-            FROM users
-            WHERE user_id != ?
-            ORDER BY last_active_at DESC
-            LIMIT ?
-            """,
-            (exclude_user_id, limit_count),
-        ).fetchall()
 
     def get_all_users(self, exclude_user_id: Optional[int] = None):
-        if exclude_user_id is None:
+        with self.lock:
+            if exclude_user_id is None:
+                return self.conn.execute(
+                    "SELECT user_id FROM users ORDER BY last_active_at DESC"
+                ).fetchall()
             return self.conn.execute(
-                "SELECT user_id FROM users ORDER BY last_active_at DESC"
+                "SELECT user_id FROM users WHERE user_id != ? ORDER BY last_active_at DESC",
+                (exclude_user_id,),
             ).fetchall()
-        return self.conn.execute(
-            "SELECT user_id FROM users WHERE user_id != ? ORDER BY last_active_at DESC",
-            (exclude_user_id,),
-        ).fetchall()
 
     def set_current_session(self, admin_chat_id: int, user_id: Optional[int]) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO admin_state (admin_chat_id, current_session_user_id)
-            VALUES (?, ?)
-            ON CONFLICT(admin_chat_id) DO UPDATE SET
-                current_session_user_id = excluded.current_session_user_id
-            """,
-            (admin_chat_id, user_id),
-        )
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO admin_state (admin_chat_id, current_session_user_id)
+                VALUES (?, ?)
+                ON CONFLICT(admin_chat_id) DO UPDATE SET
+                    current_session_user_id = excluded.current_session_user_id
+                """,
+                (admin_chat_id, user_id),
+            )
+            self.conn.commit()
 
     def get_current_session(self, admin_chat_id: int) -> Optional[int]:
-        row = self.conn.execute(
-            """
-            SELECT current_session_user_id
-            FROM admin_state
-            WHERE admin_chat_id = ?
-            """,
-            (admin_chat_id,),
-        ).fetchone()
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT current_session_user_id
+                FROM admin_state
+                WHERE admin_chat_id = ?
+                """,
+                (admin_chat_id,),
+            ).fetchone()
         if not row:
             return None
         return row["current_session_user_id"]
 
     def ban_user(self, user_id: int) -> None:
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO banned_users (user_id, banned_at)
-            VALUES (?, ?)
-            """,
-            (user_id, utc_now_iso()),
-        )
-        self.conn.commit()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO banned_users (user_id, banned_at)
+                VALUES (?, ?)
+                """,
+                (user_id, utc_now_iso()),
+            )
+            self.conn.commit()
 
     def unban_user(self, user_id: int) -> bool:
-        cur = self.conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
-        self.conn.commit()
-        return cur.rowcount > 0
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def is_user_banned(self, user_id: int) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM banned_users WHERE user_id = ? LIMIT 1",
-            (user_id,),
-        ).fetchone()
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM banned_users WHERE user_id = ? LIMIT 1",
+                (user_id,),
+            ).fetchone()
         return bool(row)
 
     def delete_mappings_by_admin_message(self, admin_chat_id: int, admin_message_id: int) -> int:
-        cur = self.conn.execute(
-            """
-            DELETE FROM message_map
-            WHERE admin_chat_id = ? AND admin_message_id = ?
-            """,
-            (admin_chat_id, admin_message_id),
-        )
-        self.conn.commit()
-        return cur.rowcount
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                DELETE FROM message_map
+                WHERE admin_chat_id = ? AND admin_message_id = ?
+                """,
+                (admin_chat_id, admin_message_id),
+            )
+            self.conn.commit()
+            return cur.rowcount
 
 
-def is_admin_chat(update: Update) -> bool:
-    if not update.effective_chat:
+def is_admin_user(update: Update) -> bool:
+    if not update.effective_user:
         return False
-    return update.effective_chat.id == config.ADMIN_CHAT_ID
+    return update.effective_user.id == config.ADMIN_CHAT_ID
 
 
 def get_db(context: ContextTypes.DEFAULT_TYPE) -> RelayDB:
@@ -331,7 +348,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     db = get_db(context)
     user = update.effective_user
-    if user.id != config.ADMIN_CHAT_ID:
+    if not is_admin_user(update):
         db.touch_user(user.id, user.username, user.full_name)
     await update.message.reply_text(config.START_MESSAGE or "已连接中继机器人。发送 /id 查看你的 Telegram 用户 ID。")
 
@@ -339,13 +356,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not update.message:
         return
-    await update.message.reply_text(f"你的 Telegram 用户 ID：`{update.effective_user.id}`", parse_mode="Markdown")
+    await update.message.reply_text(f"你的 Telegram 用户 ID：{update.effective_user.id}")
 
 
 async def recent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
     db = get_db(context)
@@ -374,7 +391,7 @@ async def recent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
     db = get_db(context)
@@ -410,7 +427,7 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
     db = get_db(context)
@@ -432,7 +449,7 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
     db = get_db(context)
@@ -451,7 +468,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     if not query or not query.data:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await query.answer("无权限", show_alert=True)
         return
 
@@ -522,7 +539,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def sender_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
     reply = update.message.reply_to_message
@@ -541,7 +558,7 @@ async def sender_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
     reply = update.message.reply_to_message
@@ -589,7 +606,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def delete_pair_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
-    if not is_admin_chat(update):
+    if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
     reply = update.message.reply_to_message
@@ -632,7 +649,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     db = get_db(context)
     user = update.effective_user
 
-    if user.id == config.ADMIN_CHAT_ID:
+    if is_admin_user(update):
         await handle_admin_message(update, context)
         return
 
@@ -724,7 +741,7 @@ async def handle_edited_private_message(update: Update, context: ContextTypes.DE
     db = get_db(context)
     user = update.effective_user
 
-    if user.id == config.ADMIN_CHAT_ID:
+    if is_admin_user(update):
         rows = db.get_admin_to_user_maps(config.ADMIN_CHAT_ID, msg.message_id)
         for row in rows:
             try:

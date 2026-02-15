@@ -22,10 +22,27 @@ def parse_bot_commands(raw: str) -> List[Tuple[str, str]]:
             commands.append((command, description))
     return commands
 
+
+def get_int_env(name: str, default: str) -> int:
+    raw = os.getenv(name, default).strip()
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"环境变量 {name} 不是合法整数: {raw}") from e
+
+
+def get_float_env(name: str, default: str) -> float:
+    raw = os.getenv(name, default).strip()
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise RuntimeError(f"环境变量 {name} 不是合法数字: {raw}") from e
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+ADMIN_CHAT_ID = get_int_env("ADMIN_CHAT_ID", "0")
 DB_PATH = os.getenv("DB_PATH", "relay_bot.db").strip()
-BROADCAST_DELAY_SECONDS = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.05"))
+BROADCAST_DELAY_SECONDS = get_float_env("BROADCAST_DELAY_SECONDS", "0.05")
 START_MESSAGE = os.getenv("START_MESSAGE", "").replace("\\n", "\n").strip()
 BOT_NAME = os.getenv("BOT_NAME", "").strip()
 BOT_DESCRIPTION = os.getenv("BOT_DESCRIPTION", "").replace("\\n", "\n").strip()
