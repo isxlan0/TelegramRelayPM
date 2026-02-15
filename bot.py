@@ -173,6 +173,22 @@ class RelayDB:
                 (user_chat_id, user_message_id),
             ).fetchone()
 
+    def get_user_to_admin_maps(
+        self, user_chat_id: int, user_message_id: int
+    ):
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM message_map
+                WHERE user_chat_id = ?
+                  AND user_message_id = ?
+                  AND direction = 'user_to_admin'
+                ORDER BY id DESC
+                """,
+                (user_chat_id, user_message_id),
+            ).fetchall()
+
     def get_admin_to_user_maps(self, admin_chat_id: int, admin_message_id: int):
         with self.lock:
             return self.conn.execute(
@@ -302,7 +318,16 @@ class RelayDB:
 def is_admin_user(update: Update) -> bool:
     if not update.effective_user:
         return False
-    return update.effective_user.id == config.ADMIN_CHAT_ID
+    return update.effective_user.id in config.ADMIN_CHAT_IDS
+
+
+def get_admin_chat_id(update: Update) -> Optional[int]:
+    if not update.effective_chat:
+        return None
+    admin_chat_id = update.effective_chat.id
+    if admin_chat_id in config.ADMIN_CHAT_IDS:
+        return admin_chat_id
+    return None
 
 
 def get_db(context: ContextTypes.DEFAULT_TYPE) -> RelayDB:
@@ -319,9 +344,10 @@ def resolve_target_user_from_arg_or_reply(
             return int(context.args[0])
         except ValueError:
             return None
-    if update.message and update.message.reply_to_message:
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id and update.message and update.message.reply_to_message:
         return db.get_target_user_by_admin_message(
-            config.ADMIN_CHAT_ID, update.message.reply_to_message.message_id
+            admin_chat_id, update.message.reply_to_message.message_id
         )
     return None
 
@@ -380,7 +406,8 @@ async def recent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("用法: /recent 10")
             return
 
-    rows = db.get_recent_users(n, exclude_user_id=config.ADMIN_CHAT_ID)
+    rows = db.get_recent_users(n)
+    rows = [row for row in rows if int(row["user_id"]) not in config.ADMIN_CHAT_IDS]
     if not rows:
         await update.message.reply_text("暂无用户记录。")
         return
@@ -400,10 +427,14 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id is None:
+        await update.message.reply_text("无权限。")
+        return
     db = get_db(context)
 
     if not context.args:
-        current = db.get_current_session(config.ADMIN_CHAT_ID)
+        current = db.get_current_session(admin_chat_id)
         if current:
             await update.message.reply_text(f"当前会话用户 ID: {current}")
         else:
@@ -412,7 +443,7 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     arg = context.args[0].strip().lower()
     if arg == "clear":
-        db.set_current_session(config.ADMIN_CHAT_ID, None)
+        db.set_current_session(admin_chat_id, None)
         await update.message.reply_text("已清空当前会话。")
         return
 
@@ -426,7 +457,7 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"用户 {target_user_id} 已封禁，不能设为当前会话。")
         return
 
-    db.set_current_session(config.ADMIN_CHAT_ID, target_user_id)
+    db.set_current_session(admin_chat_id, target_user_id)
     await update.message.reply_text(f"当前会话已切换到用户：{target_user_id}")
 
 
@@ -434,6 +465,10 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     if not is_admin_user(update):
+        await update.message.reply_text("无权限。")
+        return
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id is None:
         await update.message.reply_text("无权限。")
         return
     db = get_db(context)
@@ -445,8 +480,8 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     already_banned = db.is_user_banned(target_user_id)
     if not already_banned:
         db.ban_user(target_user_id)
-        if db.get_current_session(config.ADMIN_CHAT_ID) == target_user_id:
-            db.set_current_session(config.ADMIN_CHAT_ID, None)
+        if db.get_current_session(admin_chat_id) == target_user_id:
+            db.set_current_session(admin_chat_id, None)
     await update.message.reply_text(
         f"用户 {target_user_id} 已封禁。" if not already_banned else f"用户 {target_user_id} 已经是封禁状态。"
     )
@@ -477,10 +512,14 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin_user(update):
         await query.answer("无权限", show_alert=True)
         return
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id is None:
+        await query.answer("无权限", show_alert=True)
+        return
 
     db = get_db(context)
     if query.data == "sessclear":
-        db.set_current_session(config.ADMIN_CHAT_ID, None)
+        db.set_current_session(admin_chat_id, None)
         await query.answer("已清空当前会话")
         return
 
@@ -495,7 +534,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         if db.is_user_banned(target_id):
             await query.answer("该用户已封禁，不能设为会话", show_alert=True)
             return
-        db.set_current_session(config.ADMIN_CHAT_ID, target_id)
+        db.set_current_session(admin_chat_id, target_id)
         await query.answer(f"当前会话已切换到 {target_id}")
         return
 
@@ -503,8 +542,8 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         already_banned = db.is_user_banned(target_id)
         if not already_banned:
             db.ban_user(target_id)
-            if db.get_current_session(config.ADMIN_CHAT_ID) == target_id:
-                db.set_current_session(config.ADMIN_CHAT_ID, None)
+            if db.get_current_session(admin_chat_id) == target_id:
+                db.set_current_session(admin_chat_id, None)
         await query.answer("已封禁该用户" if not already_banned else "该用户已封禁")
         return
 
@@ -518,7 +557,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if action == "delpair":
-        mappings = db.get_maps_by_admin_message(config.ADMIN_CHAT_ID, target_id)
+        mappings = db.get_maps_by_admin_message(admin_chat_id, target_id)
         if not mappings:
             await query.answer("没有可删除的消息")
             return
@@ -526,7 +565,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         failed = 0
         for row in mappings:
             try:
-                await context.bot.delete_message(config.ADMIN_CHAT_ID, row["admin_message_id"])
+                await context.bot.delete_message(admin_chat_id, row["admin_message_id"])
                 deleted += 1
             except (BadRequest, Forbidden, TelegramError):
                 failed += 1
@@ -535,7 +574,7 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 deleted += 1
             except (BadRequest, Forbidden, TelegramError):
                 failed += 1
-        db.delete_mappings_by_admin_message(config.ADMIN_CHAT_ID, target_id)
+        db.delete_mappings_by_admin_message(admin_chat_id, target_id)
         await query.answer(f"删除完成 成功{deleted} 失败{failed}")
         return
 
@@ -548,13 +587,17 @@ async def sender_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id is None:
+        await update.message.reply_text("无权限。")
+        return
     reply = update.message.reply_to_message
     if not reply:
         await update.message.reply_text("请回复一条转发消息后再执行 /sender")
         return
 
     db = get_db(context)
-    user_id = db.get_target_user_by_admin_message(config.ADMIN_CHAT_ID, reply.message_id)
+    user_id = db.get_target_user_by_admin_message(admin_chat_id, reply.message_id)
     if not user_id:
         await update.message.reply_text("找不到这条消息对应的用户映射。")
         return
@@ -567,6 +610,10 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id is None:
+        await update.message.reply_text("无权限。")
+        return
     reply = update.message.reply_to_message
     inline_text = " ".join(context.args).strip() if context.args else ""
     if not reply and not inline_text:
@@ -574,7 +621,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     db = get_db(context)
-    users = db.get_all_users(exclude_user_id=config.ADMIN_CHAT_ID)
+    users = db.get_all_users(exclude_user_id=admin_chat_id)
     if not users:
         await update.message.reply_text("没有可广播的用户。")
         return
@@ -589,14 +636,14 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if reply:
                 copied = await context.bot.copy_message(
                     chat_id=target_id,
-                    from_chat_id=config.ADMIN_CHAT_ID,
+                    from_chat_id=admin_chat_id,
                     message_id=reply.message_id,
                 )
             else:
                 copied = await context.bot.send_message(chat_id=target_id, text=inline_text)
             db.save_mapping(
                 user_chat_id=target_id,
-                admin_chat_id=config.ADMIN_CHAT_ID,
+                admin_chat_id=admin_chat_id,
                 user_message_id=copied.message_id,
                 admin_message_id=source_admin_message_id,
                 direction="broadcast",
@@ -615,13 +662,17 @@ async def delete_pair_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not is_admin_user(update):
         await update.message.reply_text("无权限。")
         return
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id is None:
+        await update.message.reply_text("无权限。")
+        return
     reply = update.message.reply_to_message
     if not reply:
         await update.message.reply_text("请回复一条消息后执行 /deletepair")
         return
 
     db = get_db(context)
-    mappings = db.get_maps_by_admin_message(config.ADMIN_CHAT_ID, reply.message_id)
+    mappings = db.get_maps_by_admin_message(admin_chat_id, reply.message_id)
     if not mappings:
         await update.message.reply_text("没有找到可删除的消息。")
         return
@@ -631,7 +682,7 @@ async def delete_pair_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     for row in mappings:
         try:
-            await context.bot.delete_message(config.ADMIN_CHAT_ID, row["admin_message_id"])
+            await context.bot.delete_message(admin_chat_id, row["admin_message_id"])
             deleted += 1
         except (BadRequest, Forbidden, TelegramError):
             failed += 1
@@ -641,7 +692,7 @@ async def delete_pair_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except (BadRequest, Forbidden, TelegramError):
             failed += 1
 
-    db.delete_mappings_by_admin_message(config.ADMIN_CHAT_ID, reply.message_id)
+    db.delete_mappings_by_admin_message(admin_chat_id, reply.message_id)
     await update.message.reply_text(f"删除完成。成功: {deleted}，失败: {failed}")
 
 
@@ -670,46 +721,54 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         f"ID：{user.id}\n"
         "内容：见下方转发消息"
     )
-    user_card_msg = await context.bot.send_message(chat_id=config.ADMIN_CHAT_ID, text=user_card)
 
-    try:
-        forwarded = await context.bot.forward_message(
-            chat_id=config.ADMIN_CHAT_ID,
-            from_chat_id=update.effective_chat.id,
-            message_id=msg.message_id,
+    forwarded_count = 0
+    for admin_chat_id in config.ADMIN_CHAT_IDS:
+        try:
+            user_card_msg = await context.bot.send_message(chat_id=admin_chat_id, text=user_card)
+            forwarded = await context.bot.forward_message(
+                chat_id=admin_chat_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+            )
+        except (BadRequest, Forbidden, TelegramError) as e:
+            logging.exception("forward user->admin failed for %s: %s", admin_chat_id, e)
+            continue
+
+        db.save_mapping(
+            user_chat_id=user.id,
+            admin_chat_id=admin_chat_id,
+            user_message_id=msg.message_id,
+            admin_message_id=forwarded.message_id,
+            direction="user_to_admin",
         )
-    except (BadRequest, Forbidden, TelegramError) as e:
-        logging.exception("forward user->admin failed: %s", e)
-        await msg.reply_text("消息转发失败，请稍后重试。")
-        return
+        await context.bot.edit_message_reply_markup(
+            chat_id=admin_chat_id,
+            message_id=user_card_msg.message_id,
+            reply_markup=admin_action_keyboard(user.id, forwarded.message_id),
+        )
+        forwarded_count += 1
 
-    db.save_mapping(
-        user_chat_id=user.id,
-        admin_chat_id=config.ADMIN_CHAT_ID,
-        user_message_id=msg.message_id,
-        admin_message_id=forwarded.message_id,
-        direction="user_to_admin",
-    )
-    await context.bot.edit_message_reply_markup(
-        chat_id=config.ADMIN_CHAT_ID,
-        message_id=user_card_msg.message_id,
-        reply_markup=admin_action_keyboard(user.id, forwarded.message_id),
-    )
+    if forwarded_count == 0:
+        await msg.reply_text("消息转发失败，请稍后重试。")
 
 
 async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     if not msg:
         return
+    admin_chat_id = get_admin_chat_id(update)
+    if admin_chat_id is None:
+        return
     db = get_db(context)
 
     target_user_id = None
     if msg.reply_to_message:
         target_user_id = db.get_target_user_by_admin_message(
-            config.ADMIN_CHAT_ID, msg.reply_to_message.message_id
+            admin_chat_id, msg.reply_to_message.message_id
         )
     if not target_user_id:
-        target_user_id = db.get_current_session(config.ADMIN_CHAT_ID)
+        target_user_id = db.get_current_session(admin_chat_id)
 
     if not target_user_id:
         await msg.reply_text("请回复一条用户转发消息，或先用 /session <用户ID> 设定当前会话。")
@@ -721,7 +780,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         copied = await context.bot.copy_message(
             chat_id=target_user_id,
-            from_chat_id=config.ADMIN_CHAT_ID,
+            from_chat_id=admin_chat_id,
             message_id=msg.message_id,
         )
     except (BadRequest, Forbidden, TelegramError):
@@ -730,7 +789,7 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     db.save_mapping(
         user_chat_id=target_user_id,
-        admin_chat_id=config.ADMIN_CHAT_ID,
+        admin_chat_id=admin_chat_id,
         user_message_id=copied.message_id,
         admin_message_id=msg.message_id,
         direction="admin_to_user",
@@ -745,10 +804,12 @@ async def handle_edited_private_message(update: Update, context: ContextTypes.DE
         return
 
     db = get_db(context)
-    user = update.effective_user
 
     if is_admin_user(update):
-        rows = db.get_admin_to_user_maps(config.ADMIN_CHAT_ID, msg.message_id)
+        admin_chat_id = get_admin_chat_id(update)
+        if admin_chat_id is None:
+            return
+        rows = db.get_admin_to_user_maps(admin_chat_id, msg.message_id)
         for row in rows:
             try:
                 if msg.text is not None:
@@ -769,27 +830,28 @@ async def handle_edited_private_message(update: Update, context: ContextTypes.DE
                 continue
         return
 
-    row = db.get_user_to_admin_map(user.id, msg.message_id)
-    if not row:
+    rows = db.get_user_to_admin_maps(update.effective_user.id, msg.message_id)
+    if not rows:
         return
 
-    try:
-        if msg.text is not None:
-            await context.bot.edit_message_text(
-                chat_id=config.ADMIN_CHAT_ID,
-                message_id=row["admin_message_id"],
-                text=msg.text,
-                entities=msg.entities,
-            )
-        elif msg.caption is not None:
-            await context.bot.edit_message_caption(
-                chat_id=config.ADMIN_CHAT_ID,
-                message_id=row["admin_message_id"],
-                caption=msg.caption,
-                caption_entities=msg.caption_entities,
-            )
-    except (BadRequest, Forbidden, TelegramError):
-        return
+    for row in rows:
+        try:
+            if msg.text is not None:
+                await context.bot.edit_message_text(
+                    chat_id=row["admin_chat_id"],
+                    message_id=row["admin_message_id"],
+                    text=msg.text,
+                    entities=msg.entities,
+                )
+            elif msg.caption is not None:
+                await context.bot.edit_message_caption(
+                    chat_id=row["admin_chat_id"],
+                    message_id=row["admin_message_id"],
+                    caption=msg.caption,
+                    caption_entities=msg.caption_entities,
+                )
+        except (BadRequest, Forbidden, TelegramError):
+            continue
 
 
 async def private_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -800,7 +862,7 @@ async def private_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def validate_config() -> None:
     if not config.BOT_TOKEN or "PLEASE_REPLACE" in config.BOT_TOKEN:
         raise RuntimeError("请先在 config.py 中填写 BOT_TOKEN。")
-    if not isinstance(config.ADMIN_CHAT_ID, int) or config.ADMIN_CHAT_ID == 0:
+    if not config.ADMIN_CHAT_IDS:
         raise RuntimeError("请先在 config.py 中填写正确的 ADMIN_CHAT_ID。")
 
 
@@ -861,15 +923,16 @@ async def setup_bot_profile(app: Application) -> None:
     if config.BOT_ADMIN_COMMANDS:
         try:
             admin_commands = [BotCommand(command=c, description=d) for c, d in config.BOT_ADMIN_COMMANDS]
-            scope = BotCommandScopeChat(chat_id=config.ADMIN_CHAT_ID)
-            current = await app.bot.get_my_commands(scope=scope)
-            current_pairs = [(c.command, c.description) for c in current]
-            target_pairs = [(c.command, c.description) for c in admin_commands]
-            if current_pairs != target_pairs:
-                await app.bot.set_my_commands(commands=admin_commands, scope=scope)
-                logging.info("管理员命令菜单已同步。")
-            else:
-                logging.info("管理员命令菜单无变更，跳过同步。")
+            for admin_chat_id in config.ADMIN_CHAT_IDS:
+                scope = BotCommandScopeChat(chat_id=admin_chat_id)
+                current = await app.bot.get_my_commands(scope=scope)
+                current_pairs = [(c.command, c.description) for c in current]
+                target_pairs = [(c.command, c.description) for c in admin_commands]
+                if current_pairs != target_pairs:
+                    await app.bot.set_my_commands(commands=admin_commands, scope=scope)
+                    logging.info("管理员(%s)命令菜单已同步。", admin_chat_id)
+                else:
+                    logging.info("管理员(%s)命令菜单无变更，跳过同步。", admin_chat_id)
         except RetryAfter as e:
             logging.warning("管理员命令菜单触发频控，约 %s 秒后重试。", e.retry_after)
         except TelegramError:
