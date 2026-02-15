@@ -45,6 +45,7 @@ DB_PATH = os.getenv("DB_PATH", "relay_bot.db").strip()
 BROADCAST_DELAY_SECONDS = get_float_env("BROADCAST_DELAY_SECONDS", "0.05")
 START_MESSAGE = os.getenv("START_MESSAGE", "").replace("\\n", "\n").strip()
 BOT_NAME = os.getenv("BOT_NAME", "").strip()
+BOT_VERSION = os.getenv("BOT_VERSION", "v1.0.3").strip() or "v1.0.3"
 BOT_DESCRIPTION = os.getenv("BOT_DESCRIPTION", "").replace("\\n", "\n").strip()
 BOT_SHORT_DESCRIPTION = os.getenv("BOT_SHORT_DESCRIPTION", "").replace("\\n", "\n").strip()
 BOT_USER_COMMANDS = parse_bot_commands(os.getenv("BOT_USER_COMMANDS", ""))
