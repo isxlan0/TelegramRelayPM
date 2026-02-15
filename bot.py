@@ -1,9 +1,10 @@
 ﻿import asyncio
 import logging
+import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 from telegram import (
     BotCommand,
@@ -46,6 +47,130 @@ def trim_with_log(label: str, value: str, max_len: int) -> str:
         return value
     logging.warning("%s 超出长度限制，已自动截断到 %d 字符。", label, max_len)
     return value[:max_len]
+
+
+def parse_expiry_token(raw: str) -> Optional[str]:
+    text = raw.strip().lower()
+    if not text:
+        return None
+
+    duration_match = re.fullmatch(r"(\d+)([mhdw])", text)
+    if duration_match:
+        amount = int(duration_match.group(1))
+        unit = duration_match.group(2)
+        if amount <= 0:
+            return None
+        delta = {
+            "m": timedelta(minutes=amount),
+            "h": timedelta(hours=amount),
+            "d": timedelta(days=amount),
+            "w": timedelta(weeks=amount),
+        }[unit]
+        return (datetime.now(timezone.utc) + delta).replace(microsecond=0).isoformat()
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        try:
+            as_date = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return as_date.replace(microsecond=0).isoformat()
+
+    return None
+
+
+def format_expiry_display(expires_at: Optional[str]) -> str:
+    if not expires_at:
+        return "永久"
+    try:
+        expires_dt = datetime.fromisoformat(expires_at)
+        if expires_dt.tzinfo is None:
+            expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return expires_at
+
+    remaining = expires_dt - datetime.now(timezone.utc)
+    if remaining.total_seconds() <= 0:
+        return "已过期"
+
+    total_seconds = int(remaining.total_seconds())
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}天{hours}小时后"
+    if hours > 0:
+        return f"{hours}小时{minutes}分钟后"
+    return f"{minutes}分钟后"
+
+
+def format_unban_time_display(expires_at: Optional[str]) -> str:
+    if not expires_at:
+        return "永久"
+    try:
+        expires_dt = datetime.fromisoformat(expires_at)
+        if expires_dt.tzinfo is None:
+            expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return "永久"
+
+    remaining = expires_dt - datetime.now(timezone.utc)
+    if remaining.total_seconds() <= 0:
+        return "即将解封"
+
+    total_seconds = int(remaining.total_seconds())
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days > 0:
+        return f"{days}天{hours}小时"
+    if hours > 0:
+        return f"{hours}小时{minutes}分钟"
+    return f"{max(1, minutes)}分钟"
+
+
+def message_kind(message) -> str:
+    if message.text is not None:
+        return "text"
+    if message.photo:
+        return "photo"
+    if message.video:
+        return "video"
+    if message.document:
+        return "document"
+    if message.audio:
+        return "audio"
+    if message.voice:
+        return "voice"
+    if message.sticker:
+        return "sticker"
+    if message.animation:
+        return "animation"
+    if message.location:
+        return "location"
+    if message.contact:
+        return "contact"
+    return "other"
+
+
+def format_ban_info(row: sqlite3.Row) -> str:
+    user_id = int(row["user_id"])
+    reason = (row["reason"] or "-").strip()
+    note = (row["note"] or "-").strip()
+    expires_at = row["expires_at"]
+    operator_admin_id = int(row["operator_admin_id"])
+    created_at = row["created_at"]
+    updated_at = row["updated_at"]
+
+    return (
+        "封禁信息：\n"
+        f"- 用户ID：{user_id}\n"
+        f"- 原因：{reason}\n"
+        f"- 备注：{note}\n"
+        f"- 到期：{format_expiry_display(expires_at)}\n"
+        f"- 操作管理员：{operator_admin_id}\n"
+        f"- 创建时间：{created_at}\n"
+        f"- 更新时间：{updated_at}"
+    )
 
 
 class RelayDB:
@@ -94,9 +219,83 @@ class RelayDB:
                 user_id INTEGER PRIMARY KEY,
                 banned_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS ban_list (
+                user_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                operator_admin_id INTEGER NOT NULL,
+                reason TEXT,
+                note TEXT,
+                expires_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ban_list_expires_at
+            ON ban_list(expires_at);
+
+            CREATE TABLE IF NOT EXISTS auto_reply_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trigger_type TEXT NOT NULL,
+                trigger_text TEXT NOT NULL,
+                reply_text TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 100,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                created_by_admin_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_auto_reply_rules_enabled_priority
+            ON auto_reply_rules(is_enabled, priority, id);
+
+            CREATE TABLE IF NOT EXISTS audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                user_id INTEGER,
+                admin_chat_id INTEGER,
+                chat_id INTEGER,
+                message_id INTEGER,
+                mapped_message_id INTEGER,
+                message_kind TEXT,
+                is_edited INTEGER NOT NULL DEFAULT 0,
+                direction TEXT,
+                outcome TEXT NOT NULL,
+                error_class TEXT,
+                error_code TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_audit_events_type_time
+            ON audit_events(event_type, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_events_user_time
+            ON audit_events(user_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_events_admin_time
+            ON audit_events(admin_chat_id, created_at);
             """
             )
+            self._migrate_ban_list_from_legacy()
             self.conn.commit()
+
+    def _migrate_ban_list_from_legacy(self) -> None:
+        rows = self.conn.execute("SELECT user_id, banned_at FROM banned_users").fetchall()
+        for row in rows:
+            user_id = int(row["user_id"])
+            existing = self.conn.execute(
+                "SELECT 1 FROM ban_list WHERE user_id = ? LIMIT 1", (user_id,)
+            ).fetchone()
+            if existing:
+                continue
+            banned_at = str(row["banned_at"])
+            self.conn.execute(
+                """
+                INSERT INTO ban_list (
+                    user_id, created_at, updated_at, operator_admin_id, reason, note, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, banned_at, banned_at, config.PRIMARY_ADMIN_CHAT_ID, None, None, None),
+            )
 
     def touch_user(self, user_id: int, username: Optional[str], full_name: str) -> None:
         now = utc_now_iso()
@@ -277,30 +476,242 @@ class RelayDB:
             return None
         return row["current_session_user_id"]
 
-    def ban_user(self, user_id: int) -> None:
+    def ban_user(
+        self,
+        user_id: int,
+        operator_admin_id: int,
+        reason: Optional[str] = None,
+        note: Optional[str] = None,
+        expires_at: Optional[str] = None,
+    ) -> None:
+        now = utc_now_iso()
         with self.lock:
             self.conn.execute(
                 """
-                INSERT OR REPLACE INTO banned_users (user_id, banned_at)
-                VALUES (?, ?)
+                INSERT INTO ban_list (user_id, created_at, updated_at, operator_admin_id, reason, note, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    updated_at=excluded.updated_at,
+                    operator_admin_id=excluded.operator_admin_id,
+                    reason=excluded.reason,
+                    note=excluded.note,
+                    expires_at=excluded.expires_at
                 """,
-                (user_id, utc_now_iso()),
+                (user_id, now, now, operator_admin_id, reason, note, expires_at),
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO banned_users (user_id, banned_at) VALUES (?, ?)",
+                (user_id, now),
             )
             self.conn.commit()
 
     def unban_user(self, user_id: int) -> bool:
         with self.lock:
-            cur = self.conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+            cur = self.conn.execute("DELETE FROM ban_list WHERE user_id = ?", (user_id,))
+            self.conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
             self.conn.commit()
             return cur.rowcount > 0
 
-    def is_user_banned(self, user_id: int) -> bool:
+    def get_ban(self, user_id: int) -> Optional[sqlite3.Row]:
         with self.lock:
             row = self.conn.execute(
-                "SELECT 1 FROM banned_users WHERE user_id = ? LIMIT 1",
+                "SELECT * FROM ban_list WHERE user_id = ? LIMIT 1",
                 (user_id,),
             ).fetchone()
-        return bool(row)
+            if not row:
+                return None
+
+            expires_at = row["expires_at"]
+            if expires_at:
+                try:
+                    expires_dt = datetime.fromisoformat(expires_at)
+                    if expires_dt.tzinfo is None:
+                        expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    expires_dt = None
+                if expires_dt and expires_dt <= datetime.now(timezone.utc):
+                    self.conn.execute("DELETE FROM ban_list WHERE user_id = ?", (user_id,))
+                    self.conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+                    self.conn.commit()
+                    return None
+
+            return row
+
+    def is_user_banned(self, user_id: int) -> bool:
+        return self.get_ban(user_id) is not None
+
+    def list_active_bans(self, limit_count: int):
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM ban_list
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (limit_count,),
+            ).fetchall()
+
+        active = []
+        for row in rows:
+            refreshed = self.get_ban(int(row["user_id"]))
+            if refreshed is not None:
+                active.append(refreshed)
+        return active
+
+    def add_auto_reply_rule(
+        self,
+        trigger_type: str,
+        trigger_text: str,
+        reply_text: str,
+        priority: int,
+        created_by_admin_id: int,
+    ) -> int:
+        now = utc_now_iso()
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                INSERT INTO auto_reply_rules (
+                    trigger_type, trigger_text, reply_text, priority, is_enabled,
+                    created_by_admin_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                """,
+                (trigger_type, trigger_text, reply_text, priority, created_by_admin_id, now, now),
+            )
+            self.conn.commit()
+            return int(cur.lastrowid)
+
+    def list_auto_reply_rules(self, limit_count: int = 50):
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT *
+                FROM auto_reply_rules
+                ORDER BY priority ASC, id ASC
+                LIMIT ?
+                """,
+                (limit_count,),
+            ).fetchall()
+
+    def set_auto_reply_rule_enabled(self, rule_id: int, enabled: bool) -> bool:
+        now = utc_now_iso()
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                UPDATE auto_reply_rules
+                SET is_enabled = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (1 if enabled else 0, now, rule_id),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def delete_auto_reply_rule(self, rule_id: int) -> bool:
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM auto_reply_rules WHERE id = ?", (rule_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def match_auto_reply_rule(self, text: str) -> Optional[sqlite3.Row]:
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT *
+                FROM auto_reply_rules
+                WHERE is_enabled = 1
+                ORDER BY priority ASC, id ASC
+                """
+            ).fetchall()
+
+        candidate = text.strip()
+        for row in rows:
+            trigger_type = str(row["trigger_type"])
+            trigger_text = str(row["trigger_text"])
+            matched = False
+            if trigger_type == "exact":
+                matched = candidate == trigger_text
+            elif trigger_type == "contains":
+                matched = trigger_text in candidate
+            elif trigger_type == "prefix":
+                matched = candidate.startswith(trigger_text)
+            elif trigger_type == "regex":
+                try:
+                    matched = re.search(trigger_text, candidate) is not None
+                except re.error:
+                    matched = False
+            if matched:
+                return row
+        return None
+
+    def record_audit_event(
+        self,
+        event_type: str,
+        outcome: str,
+        user_id: Optional[int] = None,
+        admin_chat_id: Optional[int] = None,
+        chat_id: Optional[int] = None,
+        message_id: Optional[int] = None,
+        mapped_message_id: Optional[int] = None,
+        msg_kind: Optional[str] = None,
+        is_edited: bool = False,
+        direction: Optional[str] = None,
+        error_class: Optional[str] = None,
+        error_code: Optional[str] = None,
+    ) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO audit_events (
+                    event_type, user_id, admin_chat_id, chat_id, message_id, mapped_message_id,
+                    message_kind, is_edited, direction, outcome, error_class, error_code, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_type,
+                    user_id,
+                    admin_chat_id,
+                    chat_id,
+                    message_id,
+                    mapped_message_id,
+                    msg_kind,
+                    1 if is_edited else 0,
+                    direction,
+                    outcome,
+                    error_class,
+                    error_code,
+                    utc_now_iso(),
+                ),
+            )
+            self.conn.commit()
+
+    def get_stats_counts(self, since_iso: str):
+        with self.lock:
+            rows = self.conn.execute(
+                """
+                SELECT event_type, outcome, COUNT(*) AS cnt
+                FROM audit_events
+                WHERE created_at >= ?
+                GROUP BY event_type, outcome
+                """,
+                (since_iso,),
+            ).fetchall()
+        return rows
+
+    def get_top_users_by_events(self, since_iso: str, limit_count: int = 10):
+        with self.lock:
+            return self.conn.execute(
+                """
+                SELECT user_id, COUNT(*) AS cnt
+                FROM audit_events
+                WHERE created_at >= ?
+                  AND user_id IS NOT NULL
+                GROUP BY user_id
+                ORDER BY cnt DESC
+                LIMIT ?
+                """,
+                (since_iso, limit_count),
+            ).fetchall()
 
     def delete_mappings_by_admin_message(self, admin_chat_id: int, admin_message_id: int) -> int:
         with self.lock:
@@ -343,7 +754,7 @@ def resolve_target_user_from_arg_or_reply(
         try:
             return int(context.args[0])
         except ValueError:
-            return None
+            pass
     admin_chat_id = get_admin_chat_id(update)
     if admin_chat_id and update.message and update.message.reply_to_message:
         return db.get_target_user_by_admin_message(
@@ -352,10 +763,94 @@ def resolve_target_user_from_arg_or_reply(
     return None
 
 
-def admin_action_keyboard(user_id: int, admin_message_id: Optional[int] = None) -> InlineKeyboardMarkup:
+def parse_ban_extra_args(args: List[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if not args:
+        return None, None, None
+
+    remaining = list(args)
+    expires_at = parse_expiry_token(remaining[0])
+    if expires_at is not None:
+        remaining = remaining[1:]
+
+    text = " ".join(remaining).strip()
+    if not text:
+        return expires_at, None, None
+
+    if "|" in text:
+        reason_text, note_text = text.split("|", 1)
+        reason = reason_text.strip() or None
+        note = note_text.strip() or None
+    else:
+        reason = text
+        note = None
+
+    return expires_at, reason, note
+
+
+def parse_rule_add_payload(raw: str) -> Optional[Tuple[str, str, str]]:
+    if "=>" not in raw:
+        return None
+    left, reply_text = raw.split("=>", 1)
+    left = left.strip()
+    reply_text = reply_text.strip()
+    if not left or not reply_text:
+        return None
+
+    if " " not in left:
+        return None
+    trigger_type, trigger_text = left.split(" ", 1)
+    trigger_type = trigger_type.strip().lower()
+    trigger_text = trigger_text.strip()
+    if trigger_type not in {"exact", "contains", "prefix", "regex"}:
+        return None
+    if not trigger_text:
+        return None
+    return trigger_type, trigger_text, reply_text
+
+
+def parse_stats_window(arg: Optional[str]) -> Tuple[str, datetime]:
+    text = (arg or "24h").strip().lower()
+    now = datetime.now(timezone.utc)
+    if text == "7d":
+        return "7d", now - timedelta(days=7)
+    if text == "30d":
+        return "30d", now - timedelta(days=30)
+    return "24h", now - timedelta(hours=24)
+
+
+def session_panel_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = []
+    for row in rows:
+        user_id = int(row["user_id"])
+        name = str(row["full_name"])
+        display = name if len(name) <= 12 else f"{name[:11]}…"
+        buttons.append([InlineKeyboardButton(f"{display} ({user_id})", callback_data=f"sess:{user_id}")])
+
+    buttons.append([InlineKeyboardButton("清空会话", callback_data="sessclear")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def ban_duration_keyboard(user_id: int, admin_message_id: int) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton("封禁用户", callback_data=f"ban:{user_id}"),
+            InlineKeyboardButton("1小时", callback_data=f"banfor:{user_id}:1h:{admin_message_id}"),
+            InlineKeyboardButton("1天", callback_data=f"banfor:{user_id}:1d:{admin_message_id}"),
+            InlineKeyboardButton("7天", callback_data=f"banfor:{user_id}:7d:{admin_message_id}"),
+        ],
+        [
+            InlineKeyboardButton("30天", callback_data=f"banfor:{user_id}:30d:{admin_message_id}"),
+            InlineKeyboardButton("永久", callback_data=f"banfor:{user_id}:permanent:{admin_message_id}"),
+        ],
+        [InlineKeyboardButton("返回", callback_data=f"actmenu:{user_id}:{admin_message_id}")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_action_keyboard(user_id: int, admin_message_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    ban_callback = f"banmenu:{user_id}:{admin_message_id}" if admin_message_id is not None else f"ban:{user_id}"
+    rows = [
+        [
+            InlineKeyboardButton("封禁用户", callback_data=ban_callback),
             InlineKeyboardButton("解封用户", callback_data=f"unban:{user_id}"),
             InlineKeyboardButton("设为会话", callback_data=f"sess:{user_id}"),
         ],
@@ -435,10 +930,20 @@ async def session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if not context.args:
         current = db.get_current_session(admin_chat_id)
-        if current:
-            await update.message.reply_text(f"当前会话用户 ID: {current}")
-        else:
-            await update.message.reply_text("当前没有会话。用法：/session <用户ID> 或 /session clear")
+        recent_rows = db.get_recent_users(8)
+        recent_rows = [row for row in recent_rows if int(row["user_id"]) not in config.ADMIN_CHAT_IDS]
+        if not recent_rows:
+            if current:
+                await update.message.reply_text(f"当前会话用户 ID: {current}")
+            else:
+                await update.message.reply_text("当前没有会话。用法：/session <用户ID> 或 /session clear")
+            return
+
+        title = f"当前会话用户 ID: {current}" if current else "当前没有会话，点击下方按钮可快速切换："
+        await update.message.reply_text(
+            title,
+            reply_markup=session_panel_keyboard(recent_rows),
+        )
         return
 
     arg = context.args[0].strip().lower()
@@ -472,19 +977,116 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("无权限。")
         return
     db = get_db(context)
+
     target_user_id = resolve_target_user_from_arg_or_reply(update, context, db)
     if not target_user_id:
-        await update.message.reply_text("用法：/ban <用户ID>，或回复用户转发消息后发送 /ban")
+        await update.message.reply_text(
+            "用法：/ban <用户ID> [1h|1d|7d|YYYY-MM-DD] [原因]，或回复用户转发消息后 /ban\n"
+            "备注可用分隔符：原因 | 备注"
+        )
         return
 
+    extra_args: List[str] = []
+    if context.args:
+        first_arg_is_user_id = False
+        try:
+            int(context.args[0])
+            first_arg_is_user_id = True
+        except ValueError:
+            first_arg_is_user_id = False
+        if first_arg_is_user_id:
+            extra_args = context.args[1:]
+        else:
+            extra_args = context.args
+
+    expires_at, reason, note = parse_ban_extra_args(extra_args)
+
     already_banned = db.is_user_banned(target_user_id)
-    if not already_banned:
-        db.ban_user(target_user_id)
-        if db.get_current_session(admin_chat_id) == target_user_id:
-            db.set_current_session(admin_chat_id, None)
-    await update.message.reply_text(
-        f"用户 {target_user_id} 已封禁。" if not already_banned else f"用户 {target_user_id} 已经是封禁状态。"
+    db.ban_user(
+        target_user_id,
+        operator_admin_id=admin_chat_id,
+        reason=reason,
+        note=note,
+        expires_at=expires_at,
     )
+
+    if not already_banned and db.get_current_session(admin_chat_id) == target_user_id:
+        db.set_current_session(admin_chat_id, None)
+
+    ban_row = db.get_ban(target_user_id)
+    if ban_row:
+        await update.message.reply_text(format_ban_info(ban_row))
+    else:
+        await update.message.reply_text(f"用户 {target_user_id} 已封禁。")
+
+
+async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin_user(update):
+        await update.message.reply_text("无权限。")
+        return
+
+    db = get_db(context)
+    n = 20
+    if context.args:
+        try:
+            n = max(1, min(100, int(context.args[0])))
+        except ValueError:
+            await update.message.reply_text("用法：/banlist [数量]")
+            return
+
+    rows = db.list_active_bans(n)
+    if not rows:
+        await update.message.reply_text("当前没有有效封禁。")
+        return
+
+    lines = ["当前封禁列表："]
+    for idx, row in enumerate(rows, start=1):
+        reason = (row["reason"] or "-").strip()
+        note = (row["note"] or "-").strip()
+        lines.append(
+            f"{idx}. 用户ID: {row['user_id']} | 到期: {format_expiry_display(row['expires_at'])} | 原因: {reason} | 备注: {note}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+async def baninfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin_user(update):
+        await update.message.reply_text("无权限。")
+        return
+
+    db = get_db(context)
+
+    if context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("用法：/baninfo <用户ID>，或回复用户转发消息后 /baninfo")
+            return
+    elif update.message.reply_to_message:
+        admin_chat_id = get_admin_chat_id(update)
+        if admin_chat_id is None:
+            await update.message.reply_text("无权限。")
+            return
+        target_user_id = db.get_target_user_by_admin_message(
+            admin_chat_id, update.message.reply_to_message.message_id
+        )
+        if not target_user_id:
+            await update.message.reply_text("找不到这条消息对应的用户映射。")
+            return
+    else:
+        await update.message.reply_text("用法：/baninfo <用户ID>，或回复用户转发消息后 /baninfo")
+        return
+
+    row = db.get_ban(target_user_id)
+    if not row:
+        await update.message.reply_text(f"用户 {target_user_id} 当前不在有效封禁列表。")
+        return
+
+    await update.message.reply_text(format_ban_info(row))
 
 
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -523,9 +1125,69 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("已清空当前会话")
         return
 
+    parts = query.data.split(":")
+    action = parts[0]
+
+    if action == "banmenu":
+        if len(parts) != 3:
+            await query.answer("无效操作")
+            return
+        try:
+            user_id = int(parts[1])
+            admin_message_id = int(parts[2])
+        except ValueError:
+            await query.answer("无效操作")
+            return
+        await query.edit_message_reply_markup(reply_markup=ban_duration_keyboard(user_id, admin_message_id))
+        await query.answer("请选择封禁时长")
+        return
+
+    if action == "actmenu":
+        if len(parts) != 3:
+            await query.answer("无效操作")
+            return
+        try:
+            user_id = int(parts[1])
+            admin_message_id = int(parts[2])
+        except ValueError:
+            await query.answer("无效操作")
+            return
+        await query.edit_message_reply_markup(reply_markup=admin_action_keyboard(user_id, admin_message_id))
+        await query.answer("已返回快捷操作")
+        return
+
+    if action == "banfor":
+        if len(parts) != 4:
+            await query.answer("无效操作")
+            return
+        try:
+            target_id = int(parts[1])
+            duration = parts[2]
+            admin_message_id = int(parts[3])
+        except ValueError:
+            await query.answer("无效操作")
+            return
+
+        expires_at = None if duration == "permanent" else parse_expiry_token(duration)
+        if duration != "permanent" and expires_at is None:
+            await query.answer("无效封禁时长")
+            return
+
+        already_banned = db.is_user_banned(target_id)
+        db.ban_user(target_id, operator_admin_id=admin_chat_id, expires_at=expires_at)
+        if db.get_current_session(admin_chat_id) == target_id:
+            db.set_current_session(admin_chat_id, None)
+
+        await query.edit_message_reply_markup(reply_markup=admin_action_keyboard(target_id, admin_message_id))
+        duration_text = format_unban_time_display(expires_at)
+        status_text = "已封禁该用户" if not already_banned else "该用户已更新封禁"
+        await query.answer(f"{status_text}（{duration_text}）")
+        return
+
     try:
-        action, target_id_text = query.data.split(":", 1)
-        target_id = int(target_id_text)
+        if len(parts) != 2:
+            raise ValueError
+        target_id = int(parts[1])
     except ValueError:
         await query.answer("无效操作")
         return
@@ -540,11 +1202,10 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if action == "ban":
         already_banned = db.is_user_banned(target_id)
-        if not already_banned:
-            db.ban_user(target_id)
-            if db.get_current_session(admin_chat_id) == target_id:
-                db.set_current_session(admin_chat_id, None)
-        await query.answer("已封禁该用户" if not already_banned else "该用户已封禁")
+        db.ban_user(target_id, operator_admin_id=admin_chat_id)
+        if db.get_current_session(admin_chat_id) == target_id:
+            db.set_current_session(admin_chat_id, None)
+        await query.answer("已封禁该用户" if not already_banned else "该用户已更新封禁")
         return
 
     if action == "unban":
@@ -575,10 +1236,148 @@ async def admin_action_callback(update: Update, context: ContextTypes.DEFAULT_TY
             except (BadRequest, Forbidden, TelegramError):
                 failed += 1
         db.delete_mappings_by_admin_message(admin_chat_id, target_id)
+        db.record_audit_event(
+            event_type="delete_pair",
+            outcome="success" if failed == 0 else "failed",
+            admin_chat_id=admin_chat_id,
+            chat_id=admin_chat_id,
+            message_id=target_id,
+            direction="admin_to_user",
+            error_code=f"failed={failed}",
+        )
         await query.answer(f"删除完成 成功{deleted} 失败{failed}")
         return
 
     await query.answer("未知操作")
+
+
+async def rule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin_user(update):
+        await update.message.reply_text("无权限。")
+        return
+
+    db = get_db(context)
+    if not context.args:
+        await update.message.reply_text(
+            "用法：\n"
+            "/rule list\n"
+            "/rule add <exact|contains|prefix|regex> <触发词> => <回复内容>\n"
+            "/rule on <id> | /rule off <id> | /rule del <id>\n"
+            "/rule test <文本>"
+        )
+        return
+
+    sub = context.args[0].lower()
+
+    if sub == "list":
+        rows = db.list_auto_reply_rules(50)
+        if not rows:
+            await update.message.reply_text("当前没有自动回复规则。")
+            return
+        lines = ["自动回复规则："]
+        for row in rows:
+            lines.append(
+                f"#{row['id']} [{row['trigger_type']}] 触发: {row['trigger_text']} | 回复: {row['reply_text']} | 优先级: {row['priority']} | 启用: {'是' if row['is_enabled'] else '否'}"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if sub == "add":
+        payload = " ".join(context.args[1:]).strip()
+        parsed = parse_rule_add_payload(payload)
+        if not parsed:
+            await update.message.reply_text(
+                "格式错误。用法：/rule add <exact|contains|prefix|regex> <触发词> => <回复内容>"
+            )
+            return
+        trigger_type, trigger_text, reply_text = parsed
+        if trigger_type == "regex":
+            try:
+                re.compile(trigger_text)
+            except re.error:
+                await update.message.reply_text("regex 规则无效，请检查正则表达式。")
+                return
+
+        rule_id = db.add_auto_reply_rule(
+            trigger_type=trigger_type,
+            trigger_text=trigger_text,
+            reply_text=reply_text,
+            priority=100,
+            created_by_admin_id=int(update.effective_user.id),
+        )
+        await update.message.reply_text(f"规则已创建，ID: {rule_id}")
+        return
+
+    if sub in {"on", "off", "del"}:
+        if len(context.args) < 2:
+            await update.message.reply_text(f"用法：/rule {sub} <id>")
+            return
+        try:
+            rule_id = int(context.args[1])
+        except ValueError:
+            await update.message.reply_text(f"用法：/rule {sub} <id>")
+            return
+
+        if sub == "del":
+            ok = db.delete_auto_reply_rule(rule_id)
+            await update.message.reply_text("已删除规则。" if ok else "规则不存在。")
+            return
+
+        ok = db.set_auto_reply_rule_enabled(rule_id, enabled=(sub == "on"))
+        if not ok:
+            await update.message.reply_text("规则不存在。")
+            return
+        await update.message.reply_text("规则已启用。" if sub == "on" else "规则已停用。")
+        return
+
+    if sub == "test":
+        sample = " ".join(context.args[1:]).strip()
+        if not sample:
+            await update.message.reply_text("用法：/rule test <文本>")
+            return
+        row = db.match_auto_reply_rule(sample)
+        if not row:
+            await update.message.reply_text("未命中任何规则。")
+            return
+        await update.message.reply_text(
+            f"命中规则 #{row['id']} [{row['trigger_type']}]\n触发: {row['trigger_text']}\n回复: {row['reply_text']}"
+        )
+        return
+
+    await update.message.reply_text("未知子命令。可用：list/add/on/off/del/test")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    if not is_admin_user(update):
+        await update.message.reply_text("无权限。")
+        return
+
+    db = get_db(context)
+    arg = context.args[0] if context.args else None
+    window_label, since_dt = parse_stats_window(arg)
+    since_iso = since_dt.replace(microsecond=0).isoformat()
+
+    rows = db.get_stats_counts(since_iso)
+    top_users = db.get_top_users_by_events(since_iso, 10)
+
+    lines = [f"统计窗口：{window_label}"]
+    if not rows:
+        lines.append("暂无统计事件。")
+    else:
+        lines.append("事件统计：")
+        for row in rows:
+            lines.append(f"- {row['event_type']} / {row['outcome']} : {row['cnt']}")
+
+    if top_users:
+        lines.append("活跃用户TOP：")
+        for idx, row in enumerate(top_users, start=1):
+            lines.append(f"{idx}. 用户ID {row['user_id']} - 事件数 {row['cnt']}")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def sender_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -648,8 +1447,30 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 admin_message_id=source_admin_message_id,
                 direction="broadcast",
             )
+            db.record_audit_event(
+                event_type="broadcast_out",
+                outcome="success",
+                user_id=target_id,
+                admin_chat_id=admin_chat_id,
+                chat_id=admin_chat_id,
+                message_id=source_admin_message_id,
+                mapped_message_id=copied.message_id,
+                msg_kind=message_kind(reply) if reply else "text",
+                direction="admin_to_user",
+            )
             sent += 1
-        except (Forbidden, BadRequest, TelegramError):
+        except (Forbidden, BadRequest, TelegramError) as e:
+            db.record_audit_event(
+                event_type="broadcast_out",
+                outcome="failed",
+                user_id=target_id,
+                admin_chat_id=admin_chat_id,
+                chat_id=admin_chat_id,
+                message_id=source_admin_message_id,
+                msg_kind=message_kind(reply) if reply else "text",
+                direction="admin_to_user",
+                error_class=type(e).__name__,
+            )
             failed += 1
         await asyncio.sleep(config.BROADCAST_DELAY_SECONDS)
 
@@ -691,8 +1512,16 @@ async def delete_pair_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             deleted += 1
         except (BadRequest, Forbidden, TelegramError):
             failed += 1
-
     db.delete_mappings_by_admin_message(admin_chat_id, reply.message_id)
+    db.record_audit_event(
+        event_type="delete_pair",
+        outcome="success" if failed == 0 else "failed",
+        admin_chat_id=admin_chat_id,
+        chat_id=admin_chat_id,
+        message_id=reply.message_id,
+        direction="admin_to_user",
+        error_code=f"failed={failed}",
+    )
     await update.message.reply_text(f"删除完成。成功: {deleted}，失败: {failed}")
 
 
@@ -711,9 +1540,44 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     db.touch_user(user.id, user.username, user.full_name)
+    db.record_audit_event(
+        event_type="user_msg_in",
+        outcome="success",
+        user_id=user.id,
+        chat_id=update.effective_chat.id,
+        message_id=msg.message_id,
+        msg_kind=message_kind(msg),
+        direction="user_to_bot",
+    )
+
     if db.is_user_banned(user.id):
-        await msg.reply_text("你已被管理员封禁，消息不会被转发。")
+        db.record_audit_event(
+            event_type="blocked_ban",
+            outcome="blocked",
+            user_id=user.id,
+            chat_id=update.effective_chat.id,
+            message_id=msg.message_id,
+            msg_kind=message_kind(msg),
+        )
+        ban_row = db.get_ban(user.id)
+        unban_time = format_unban_time_display(ban_row["expires_at"]) if ban_row else "永久"
+        await msg.reply_text(f"您已被管理员封禁，解封时间：{unban_time}")
         return
+
+    if msg.text is not None:
+        rule = db.match_auto_reply_rule(msg.text)
+        if rule is not None:
+            db.record_audit_event(
+                event_type="auto_reply_hit",
+                outcome="success",
+                user_id=user.id,
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                msg_kind="text",
+                error_code=f"rule_id={int(rule['id'])}",
+            )
+            await msg.reply_text(str(rule["reply_text"]))
+            return
 
     user_card = (
         "来自用户的新消息\n"
@@ -732,6 +1596,17 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
                 message_id=msg.message_id,
             )
         except (BadRequest, Forbidden, TelegramError) as e:
+            db.record_audit_event(
+                event_type="forward_user_to_admin",
+                outcome="failed",
+                user_id=user.id,
+                admin_chat_id=admin_chat_id,
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                msg_kind=message_kind(msg),
+                direction="user_to_admin",
+                error_class=type(e).__name__,
+            )
             logging.exception("forward user->admin failed for %s: %s", admin_chat_id, e)
             continue
 
@@ -740,6 +1615,17 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
             admin_chat_id=admin_chat_id,
             user_message_id=msg.message_id,
             admin_message_id=forwarded.message_id,
+            direction="user_to_admin",
+        )
+        db.record_audit_event(
+            event_type="forward_user_to_admin",
+            outcome="success",
+            user_id=user.id,
+            admin_chat_id=admin_chat_id,
+            chat_id=update.effective_chat.id,
+            message_id=msg.message_id,
+            mapped_message_id=forwarded.message_id,
+            msg_kind=message_kind(msg),
             direction="user_to_admin",
         )
         await context.bot.edit_message_reply_markup(
@@ -783,7 +1669,18 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             from_chat_id=admin_chat_id,
             message_id=msg.message_id,
         )
-    except (BadRequest, Forbidden, TelegramError):
+    except (BadRequest, Forbidden, TelegramError) as e:
+        db.record_audit_event(
+            event_type="forward_admin_to_user",
+            outcome="failed",
+            user_id=target_user_id,
+            admin_chat_id=admin_chat_id,
+            chat_id=admin_chat_id,
+            message_id=msg.message_id,
+            msg_kind=message_kind(msg),
+            direction="admin_to_user",
+            error_class=type(e).__name__,
+        )
         await msg.reply_text(f"发送失败，用户可能已屏蔽机器人。用户 ID：{target_user_id}")
         return
 
@@ -792,6 +1689,17 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         admin_chat_id=admin_chat_id,
         user_message_id=copied.message_id,
         admin_message_id=msg.message_id,
+        direction="admin_to_user",
+    )
+    db.record_audit_event(
+        event_type="forward_admin_to_user",
+        outcome="success",
+        user_id=target_user_id,
+        admin_chat_id=admin_chat_id,
+        chat_id=admin_chat_id,
+        message_id=msg.message_id,
+        mapped_message_id=copied.message_id,
+        msg_kind=message_kind(msg),
         direction="admin_to_user",
     )
 
@@ -826,7 +1734,32 @@ async def handle_edited_private_message(update: Update, context: ContextTypes.DE
                         caption=msg.caption,
                         caption_entities=msg.caption_entities,
                     )
-            except (BadRequest, Forbidden, TelegramError):
+                db.record_audit_event(
+                    event_type="edit_sync_admin_to_user",
+                    outcome="success",
+                    user_id=int(row["user_chat_id"]),
+                    admin_chat_id=admin_chat_id,
+                    chat_id=admin_chat_id,
+                    message_id=msg.message_id,
+                    mapped_message_id=int(row["user_message_id"]),
+                    msg_kind=message_kind(msg),
+                    is_edited=True,
+                    direction="admin_to_user",
+                )
+            except (BadRequest, Forbidden, TelegramError) as e:
+                db.record_audit_event(
+                    event_type="edit_sync_admin_to_user",
+                    outcome="failed",
+                    user_id=int(row["user_chat_id"]),
+                    admin_chat_id=admin_chat_id,
+                    chat_id=admin_chat_id,
+                    message_id=msg.message_id,
+                    mapped_message_id=int(row["user_message_id"]),
+                    msg_kind=message_kind(msg),
+                    is_edited=True,
+                    direction="admin_to_user",
+                    error_class=type(e).__name__,
+                )
                 continue
         return
 
@@ -850,7 +1783,32 @@ async def handle_edited_private_message(update: Update, context: ContextTypes.DE
                     caption=msg.caption,
                     caption_entities=msg.caption_entities,
                 )
-        except (BadRequest, Forbidden, TelegramError):
+            db.record_audit_event(
+                event_type="edit_sync_user_to_admin",
+                outcome="success",
+                user_id=update.effective_user.id,
+                admin_chat_id=int(row["admin_chat_id"]),
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                mapped_message_id=int(row["admin_message_id"]),
+                msg_kind=message_kind(msg),
+                is_edited=True,
+                direction="user_to_admin",
+            )
+        except (BadRequest, Forbidden, TelegramError) as e:
+            db.record_audit_event(
+                event_type="edit_sync_user_to_admin",
+                outcome="failed",
+                user_id=update.effective_user.id,
+                admin_chat_id=int(row["admin_chat_id"]),
+                chat_id=update.effective_chat.id,
+                message_id=msg.message_id,
+                mapped_message_id=int(row["admin_message_id"]),
+                msg_kind=message_kind(msg),
+                is_edited=True,
+                direction="user_to_admin",
+                error_class=type(e).__name__,
+            )
             continue
 
 
@@ -983,14 +1941,18 @@ def main() -> None:
     app.add_handler(CommandHandler("recent", recent_cmd))
     app.add_handler(CommandHandler("session", session_cmd))
     app.add_handler(CommandHandler("ban", ban_cmd))
+    app.add_handler(CommandHandler("banlist", banlist_cmd))
+    app.add_handler(CommandHandler("baninfo", baninfo_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
+    app.add_handler(CommandHandler("rule", rule_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("sender", sender_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(CommandHandler("deletepair", delete_pair_cmd))
     app.add_handler(
         CallbackQueryHandler(
             admin_action_callback,
-            pattern=r"^(?:sessclear|(?:ban|unban|sess|uid|delpair):\d+)$",
+            pattern=r"^(?:sessclear|(?:ban|unban|sess|uid|delpair):\d+|banmenu:\d+:\d+|actmenu:\d+:\d+|banfor:\d+:[^:]+:\d+)$",
         )
     )
 
