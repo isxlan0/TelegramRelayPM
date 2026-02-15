@@ -17,7 +17,7 @@
 
 ## 环境要求
 
-- Python 3.10+
+- Python
 - Telegram Bot Token（通过 @BotFather 获取）
 
 ## 安装步骤
