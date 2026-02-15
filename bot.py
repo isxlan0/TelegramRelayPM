@@ -1687,7 +1687,6 @@ async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if command in {"id", "version", "chatid"}:
             handler = {"id": id_cmd, "version": version_cmd, "chatid": chatid_cmd}[command]
             await run_command_with_args(pseudo_update, context, handler, [])
-            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
             await query.answer()
             return
 
@@ -1696,7 +1695,6 @@ async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("无权限", show_alert=True)
                 return
             await run_command_with_args(pseudo_update, context, banlist_cmd, [])
-            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
             await query.answer()
             return
 
@@ -1705,7 +1703,6 @@ async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("无权限", show_alert=True)
                 return
             await run_command_with_args(pseudo_update, context, rule_cmd, ["list"])
-            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
             await query.answer()
             return
 
@@ -1719,11 +1716,6 @@ async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.answer("未知规则操作", show_alert=True)
                 return
             await run_command_with_args(pseudo_update, context, rule_cmd, [sub, rule_id])
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("规则菜单", callback_data="menu:rule"), InlineKeyboardButton("返回主菜单", callback_data="menu:home")]]
-                )
-            )
             await query.answer()
             return
 
@@ -1733,7 +1725,6 @@ async def start_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
             window = payload[2]
             await run_command_with_args(pseudo_update, context, stats_cmd, [window])
-            await query.edit_message_reply_markup(reply_markup=home_menu_button_keyboard())
             await query.answer()
             return
 
