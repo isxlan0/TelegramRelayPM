@@ -1,23 +1,43 @@
 # Telegram 双向中继机器人
 
-一个基于 `python-telegram-bot` 的私聊中继机器人。  
+一个基于 `python-telegram-bot` 的中继机器人，支持两种模式（通过 `.env` 二选一配置）：
+
+- **私聊模式（private）**：用户私聊机器人后，消息转发给管理员私聊；管理员回复或用 `/session` 指定会话后回传给用户。
+- **群组话题模式（group_topic）**：管理员在一个已开启话题（Forum）的超级群内管理用户；每个用户对应一个话题，管理员在该话题里直接发送即可自动转发给用户，无需 `/session`。
+
 适用于双方无法直接私聊（如被官方双向）时，通过机器人进行消息转发和回复。
 
 ## 功能特点
 
-- 用户私聊机器人后，消息转发给管理员
-- 管理员可直接回复转发消息，机器人自动回传给对应用户
-- 支持管理员主动会话（`/session <user_id>`）
-- 支持会话面板快捷切换最近活跃用户
+- 支持两种转发模式（`.env` 配置 `RELAY_MODE=private|group_topic`）
+- 用户私聊机器人后，消息可转发给管理员
+- 群组话题模式下：
+  - 每个用户首次私聊会自动在管理员群创建独立话题
+  - 话题标题格式为 `Full Name @username (user_id)`（无 username 时为 `Full Name (user_id)`）
+  - 用户再次私聊会复用原话题
+  - 用户名/昵称变化时会自动更新话题标题
+  - 管理员在对应话题里直接发送即可回传给用户（无需 `/session`）
+- 管理员命令可在“管理员私聊 + 管理员群”执行（群组模式）
 - 支持封禁增强（原因 / 备注 / 到期时间）
 - 支持自动回复规则（命中后自动回复，不转发管理员）
+- `/start` 支持内联按钮菜单：普通用户与管理员分离显示，管理员可在私聊与管理员群使用
+- 按钮菜单支持两列紧凑排版，并可在菜单内跳转（主菜单/统计/规则）
+- 规则管理支持按钮化操作：
+  - “添加规则”后选择类型（精确/包含/前缀/正则）
+  - 按钮引导输入 `触发词=>回复内容`（无需再输入类型前缀）
+  - 启用/停用/删除支持规则列表按钮直接点击执行，列表显示当前启用状态
+- 按钮引导输入支持取消与超时处理（默认 180 秒）
 - 支持统计命令（`/stats`）
-- 支持广播
+- 支持广播（可配置节流，建议 1 秒/用户）
 - 支持文本/媒体编辑同步
 - 支持映射消息对删除
 - 通过 SQLite 数据库本地保存路由映射与审计元数据
 - 普通用户与管理员命令菜单分离显示
 - 机器人名称、简介、短简介、命令通过 `.env` 自动同步
+
+
+## 测试机器人
+- @yozora_sky_bot
 
 ## 环境要求
 
@@ -69,24 +89,17 @@ pip install -r requirements.txt
 
 ### 6. 创建 `.env` 文件
 
-在项目根目录创建 `.env` 文件，示例内容如下：
+示例内容：请查看.env.example
 
-```env
-BOT_TOKEN="123456:replace_with_your_bot_token"
-ADMIN_CHAT_ID="123456789"
-DB_PATH="relay_bot.db"
-BROADCAST_DELAY_SECONDS="0.1"
-START_MESSAGE="公告：这里是双向消息中继机器人。\n如果你和对方无法直接私聊，可以直接在这里留言。"
-BOT_NAME="双向中继机器人"
-BOT_DESCRIPTION="这是一个双向消息中继机器人。\n当双方无法直接私聊时，可通过本机器人转发消息。"
-BOT_SHORT_DESCRIPTION="双向消息中继"
-BOT_USER_COMMANDS="start:查看公告与说明;id:查看你的用户ID"
-BOT_ADMIN_COMMANDS="start:查看公告与说明;id:查看你的用户ID;recent:管理员查看最近活跃用户;session:管理员切换当前会话;ban:管理员封禁用户;unban:管理员解封用户;sender:管理员获取发送者ID;broadcast:管理员广播消息;deletepair:管理员删除映射消息对"
-```
 
 说明：
 
-- `ADMIN_CHAT_ID` 是管理员的 Telegram 数字 ID
+- `ADMIN_CHAT_ID` 是管理员用户的 Telegram 数字 ID（可多个，`|` 分隔）
+- `RELAY_MODE` 为全局二选一：`private` 或 `group_topic`
+- `group_topic` 模式下必须配置 `ADMIN_GROUP_CHAT_ID`，且该群必须开启话题（Forum）
+- `ADMIN_GROUP_CHAT_ID` 推荐直接填写话题内的ID（随便点个话题进去https://t.me/c/xxx/1，这里的xxxx就是群ID） `1234567890`（程序自动转换为 `-1001234567890`）
+- 管理员可在群内使用 `/chatid` 获取群 ID 与话题 ID（Thread ID）
+- 广播建议 `BROADCAST_DELAY_SECONDS="1.0"`，约 1 秒 1 用户，降低限速风险
 - 值里有 `#`、空格、链接时建议使用双引号
 - 多行文本使用 `\n`
 
@@ -116,12 +129,13 @@ python bot.py
 - `/baninfo <user_id>` 或回复转发消息后 `/baninfo`，查看封禁详情
 - `/unban <user_id>` 或回复转发消息后 `/unban`，解封用户
 - `/rule list` 查看自动回复规则
-- `/rule add <exact|contains|prefix|regex> <触发词> => <回复内容>` 添加规则
-- `/rule on <id>` / `/rule off <id>` / `/rule del <id>` 管理规则
+- `/rule add <精确|包含|前缀|正则> <触发词> => <回复内容>` 添加规则（也兼容 exact|contains|prefix|regex）
+- `/rule on <id>` / `/rule off <id>` / `/rule del <id>` 管理规则（也可在菜单按钮中直接点选）
 - `/rule test <文本>` 测试规则匹配
 - `/stats [24h|7d|30d]` 查看审计统计
 - `/sender` 回复一条转发消息，查询发送者 ID
 - `/broadcast` 广播（回复消息优先；无回复时支持 `/broadcast 你好`）
+- `/chatid` 管理员查看当前 chat_id / thread_id（群组话题模式配置用）
 - `/deletepair` 回复映射消息，删除双方对应消息
 
 ## 常见问题
@@ -147,7 +161,10 @@ python bot.py
 
 ## 数据与隐私
 
-- 默认仅处理私聊消息
+- 默认仅处理私聊消息（`RELAY_MODE=private`）
+- 若开启群组话题模式（`RELAY_MODE=group_topic`），机器人仅处理：
+  - 用户对机器人的私聊消息
+  - 管理员论坛超级群（`ADMIN_GROUP_CHAT_ID`）内的消息
 - 不保存消息正文/媒体内容
 - 本地数据库仅保存转发映射、会话路由信息与审计元数据（不含消息正文）
 
