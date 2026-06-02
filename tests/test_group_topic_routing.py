@@ -56,6 +56,7 @@ def install_fake_telegram_modules() -> None:
     ext.CommandHandler = type("CommandHandler", (), {})
     ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
     ext.MessageHandler = type("MessageHandler", (), {})
+    ext.TypeHandler = type("TypeHandler", (), {"__init__": lambda self, *args, **kwargs: None})
     ext.filters = SimpleNamespace()
 
     dotenv = types.ModuleType("dotenv")
@@ -80,10 +81,18 @@ def import_bot():
     return importlib.import_module("bot")
 
 
+def reset_logging_handlers():
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+        handler.close()
+
+
 class FakeDB:
     def __init__(self):
         self.reply_targets = {}
         self.topic_targets = {}
+        self.admin_to_user_maps = {}
         self.banned = set()
         self.saved_mappings = []
         self.audit_events = []
@@ -93,6 +102,9 @@ class FakeDB:
 
     def get_user_id_by_topic(self, admin_group_chat_id, topic_thread_id):
         return self.topic_targets.get((admin_group_chat_id, topic_thread_id))
+
+    def get_admin_to_user_maps(self, admin_chat_id, admin_message_id):
+        return self.admin_to_user_maps.get((admin_chat_id, admin_message_id), [])
 
     def is_user_banned(self, user_id):
         return user_id in self.banned
@@ -107,10 +119,14 @@ class FakeDB:
 class FakeBot:
     def __init__(self):
         self.copy_calls = []
+        self.edit_text_calls = []
 
     async def copy_message(self, **kwargs):
         self.copy_calls.append(kwargs)
         return SimpleNamespace(message_id=9001)
+
+    async def edit_message_text(self, **kwargs):
+        self.edit_text_calls.append(kwargs)
 
 
 class FakeMessage:
@@ -119,6 +135,10 @@ class FakeMessage:
         self.message_thread_id = thread_id
         self.reply_to_message = reply_to_message
         self.text = text
+        self.entities = []
+        self.caption = None
+        self.caption_entities = []
+        self.sender_chat = None
         self.photo = None
         self.video = None
         self.document = None
@@ -136,11 +156,15 @@ class FakeMessage:
 
 class GroupTopicRoutingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        reset_logging_handlers()
         self.bot_module = import_bot()
         self.bot_module.config.RELAY_MODE = "group_topic"
         self.bot_module.config.ADMIN_GROUP_CHAT_ID = -1001000
         self.bot_module.config.ADMIN_GROUP_GENERAL_THREAD_ID = 1
         self.bot_module.config.ADMIN_CHAT_IDS = [1]
+
+    def tearDown(self):
+        reset_logging_handlers()
 
     async def test_non_admin_message_in_bound_topic_forwards_to_user(self):
         db = FakeDB()
@@ -209,6 +233,67 @@ class GroupTopicRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_bot.copy_calls[0]["chat_id"], 666)
         self.assertEqual(db.saved_mappings[0]["user_chat_id"], 666)
 
+    async def test_channel_post_in_bound_topic_forwards_to_user(self):
+        db = FakeDB()
+        db.topic_targets[(-1001000, 42)] = 555
+        fake_bot = FakeBot()
+        context = SimpleNamespace(bot=fake_bot, application=SimpleNamespace(bot_data={"db": db}))
+        message = FakeMessage(message_id=126, thread_id=42)
+        update = SimpleNamespace(
+            message=None,
+            channel_post=message,
+            effective_chat=SimpleNamespace(id=-1001000, type="supergroup"),
+            effective_user=None,
+        )
+
+        await self.bot_module.handle_group_topic_channel_update(update, context)
+
+        self.assertEqual(fake_bot.copy_calls, [{"chat_id": 555, "from_chat_id": -1001000, "message_id": 126}])
+        self.assertEqual(db.saved_mappings[0]["user_chat_id"], 555)
+        self.assertEqual(db.audit_events[-1]["outcome"], "success")
+
+    async def test_command_like_channel_post_is_ignored(self):
+        db = FakeDB()
+        db.topic_targets[(-1001000, 42)] = 555
+        fake_bot = FakeBot()
+        context = SimpleNamespace(bot=fake_bot, application=SimpleNamespace(bot_data={"db": db}))
+        message = FakeMessage(message_id=127, thread_id=42, text="/start")
+        update = SimpleNamespace(
+            message=None,
+            channel_post=message,
+            effective_chat=SimpleNamespace(id=-1001000, type="supergroup"),
+            effective_user=None,
+        )
+
+        await self.bot_module.handle_group_topic_channel_update(update, context)
+
+        self.assertEqual(fake_bot.copy_calls, [])
+        self.assertEqual(db.saved_mappings, [])
+
+    async def test_edited_channel_post_syncs_to_user(self):
+        db = FakeDB()
+        db.admin_to_user_maps[(-1001000, 128)] = [
+            {"user_chat_id": 555, "user_message_id": 9001}
+        ]
+        fake_bot = FakeBot()
+        context = SimpleNamespace(bot=fake_bot, application=SimpleNamespace(bot_data={"db": db}))
+        message = FakeMessage(message_id=128, thread_id=42, text="updated")
+        update = SimpleNamespace(
+            message=None,
+            edited_message=None,
+            edited_channel_post=message,
+            effective_chat=SimpleNamespace(id=-1001000, type="supergroup"),
+            effective_user=None,
+        )
+
+        await self.bot_module.handle_group_topic_channel_update(update, context)
+
+        self.assertEqual(
+            fake_bot.edit_text_calls,
+            [{"chat_id": 555, "message_id": 9001, "text": "updated", "entities": []}],
+        )
+        self.assertEqual(db.audit_events[-1]["outcome"], "success")
+
     def test_configure_logging_writes_start_time_log_file(self):
         old_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,6 +306,7 @@ class GroupTopicRoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(path.exists())
                 self.assertIn("日志文件已创建", path.read_text(encoding="utf-8"))
             finally:
+                reset_logging_handlers()
                 os.chdir(old_cwd)
 
 

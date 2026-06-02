@@ -23,6 +23,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -186,6 +187,86 @@ def message_kind(message) -> str:
 
 def is_service_message(message) -> bool:
     return any(getattr(message, field, None) is not None for field in SERVICE_MESSAGE_FIELDS)
+
+
+def update_log_meta(update: Update) -> str:
+    chat = getattr(update, "effective_chat", None)
+    user = getattr(update, "effective_user", None)
+    msg = (
+        getattr(update, "message", None)
+        or getattr(update, "channel_post", None)
+        or getattr(update, "edited_message", None)
+        or getattr(update, "edited_channel_post", None)
+    )
+    reply = getattr(msg, "reply_to_message", None) if msg else None
+    sender_chat = getattr(msg, "sender_chat", None) if msg else None
+    fields = []
+    for name in ("message", "channel_post", "edited_message", "edited_channel_post", "callback_query"):
+        if getattr(update, name, None) is not None:
+            fields.append(name)
+    parts = [
+        f"update={getattr(update, 'update_id', None)}",
+        f"fields={','.join(fields) if fields else '-'}",
+        f"chat={getattr(chat, 'id', None)}",
+        f"chat_type={getattr(chat, 'type', None)}",
+        f"user={getattr(user, 'id', None)}",
+        f"sender_chat={getattr(sender_chat, 'id', None)}",
+        f"message={getattr(msg, 'message_id', None)}",
+        f"thread={getattr(msg, 'message_thread_id', None)}",
+        f"reply_to={getattr(reply, 'message_id', None)}",
+    ]
+    if msg is not None:
+        parts.append(f"kind={message_kind(msg)}")
+    return " ".join(parts)
+
+
+def get_regular_message(update: Update):
+    return getattr(update, "message", None) or getattr(update, "channel_post", None)
+
+
+def get_edited_regular_message(update: Update):
+    return getattr(update, "edited_message", None) or getattr(update, "edited_channel_post", None)
+
+
+def is_command_like_message(message) -> bool:
+    text = getattr(message, "text", None) or getattr(message, "caption", None)
+    return isinstance(text, str) and text.strip().startswith("/")
+
+
+async def log_group_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if config.RELAY_MODE != "group_topic" or config.ADMIN_GROUP_CHAT_ID is None:
+        return
+    if not update.effective_chat or update.effective_chat.id != config.ADMIN_GROUP_CHAT_ID:
+        return
+    logging.info("配置群组收到Update：%s", update_log_meta(update))
+
+
+async def handle_group_topic_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if getattr(update, "message", None) is not None:
+        return
+    if getattr(update, "channel_post", None) is None:
+        return
+    if is_command_like_message(update.channel_post):
+        return
+    await handle_group_topic_message(update, context)
+
+
+async def handle_edited_group_topic_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if getattr(update, "edited_message", None) is not None:
+        return
+    if getattr(update, "edited_channel_post", None) is None:
+        return
+    if is_command_like_message(update.edited_channel_post):
+        return
+    await handle_edited_group_admin_message(update, context)
+
+
+async def handle_group_topic_channel_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if getattr(update, "channel_post", None) is not None:
+        await handle_group_topic_channel_post(update, context)
+        return
+    if getattr(update, "edited_channel_post", None) is not None:
+        await handle_edited_group_topic_channel_post(update, context)
 
 
 def format_ban_info(row: sqlite3.Row) -> str:
@@ -920,7 +1001,7 @@ def resolve_target_user_from_group_topic(db: RelayDB, update: Update) -> Optiona
         return None
     if not update.effective_chat or update.effective_chat.id != config.ADMIN_GROUP_CHAT_ID:
         return None
-    msg = update.message
+    msg = get_regular_message(update)
     if not msg or msg.message_thread_id is None:
         return None
     thread_id = int(msg.message_thread_id)
@@ -2455,14 +2536,16 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_group_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message
+    msg = get_regular_message(update)
     if not msg or not update.effective_chat:
         return
     if config.RELAY_MODE != "group_topic" or config.ADMIN_GROUP_CHAT_ID is None:
         return
     if update.effective_chat.id != config.ADMIN_GROUP_CHAT_ID:
         return
+    logging.info("群组话题消息进入路由：%s", update_log_meta(update))
     if is_service_message(msg):
+        logging.info("群组话题服务消息跳过：%s", update_log_meta(update))
         return
 
     db = get_db(context)
@@ -2475,6 +2558,11 @@ async def handle_group_topic_message(update: Update, context: ContextTypes.DEFAU
         )
     if not target_user_id:
         target_user_id = resolve_target_user_from_group_topic(db, update)
+    logging.info(
+        "群组话题目标解析：%s target_user=%s",
+        update_log_meta(update),
+        target_user_id,
+    )
 
     if not target_user_id:
         thread_id = msg.message_thread_id
@@ -2542,10 +2630,16 @@ async def handle_group_topic_message(update: Update, context: ContextTypes.DEFAU
         msg_kind=message_kind(msg),
         direction="admin_to_user",
     )
+    logging.info(
+        "群组话题消息已转发：%s target_user=%s user_message=%s",
+        update_log_meta(update),
+        target_user_id,
+        copied.message_id,
+    )
 
 
 async def handle_edited_group_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.edited_message
+    msg = get_edited_regular_message(update)
     if not msg or not update.effective_chat:
         return
     if config.RELAY_MODE != "group_topic" or config.ADMIN_GROUP_CHAT_ID is None:
@@ -2709,7 +2803,8 @@ async def handle_edited_private_message(update: Update, context: ContextTypes.DE
 
 
 async def private_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_chat or not update.message:
+    msg = get_regular_message(update)
+    if not update.effective_chat or not msg:
         return
     if update.effective_chat.type == ChatType.PRIVATE:
         return
@@ -2725,7 +2820,7 @@ async def private_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await handle_group_topic_message(update, context)
         return
 
-    await update.message.reply_text("该机器人仅支持私聊使用。")
+    await msg.reply_text("该机器人仅支持私聊使用。")
 
 
 def validate_config() -> None:
@@ -2775,9 +2870,29 @@ async def sync_if_changed(
 
 
 async def setup_bot_profile(app: Application) -> None:
+    bot_id = None
+    try:
+        me = await app.bot.get_me()
+        bot_id = getattr(me, "id", None)
+        logging.info(
+            "机器人信息：id=%s username=%s can_read_all_group_messages=%s",
+            bot_id,
+            getattr(me, "username", None),
+            getattr(me, "can_read_all_group_messages", None),
+        )
+    except TelegramError:
+        logging.exception("获取机器人自身信息失败。")
+
     if config.RELAY_MODE == "group_topic" and config.ADMIN_GROUP_CHAT_ID is not None:
         try:
             chat = await app.bot.get_chat(config.ADMIN_GROUP_CHAT_ID)
+            logging.info(
+                "管理员群信息：chat_id=%s type=%s is_forum=%s title=%s",
+                config.ADMIN_GROUP_CHAT_ID,
+                getattr(chat, "type", None),
+                getattr(chat, "is_forum", None),
+                getattr(chat, "title", None),
+            )
             if getattr(chat, "type", None) != ChatType.SUPERGROUP or not getattr(chat, "is_forum", False):
                 logging.warning(
                     "group_topic 模式下 ADMIN_GROUP_CHAT_ID=%s 不是已开启话题的超级群，相关转发功能可能不可用。",
@@ -2786,6 +2901,23 @@ async def setup_bot_profile(app: Application) -> None:
         except TelegramError as e:
             logging.warning(
                 "无法获取管理员群信息（ADMIN_GROUP_CHAT_ID=%s）：%s；程序继续运行，可在任意群执行 /chatid 排查。",
+                config.ADMIN_GROUP_CHAT_ID,
+                e,
+            )
+        try:
+            if bot_id is None:
+                logging.warning("无法检查机器人在管理员群成员状态：未拿到机器人 ID。")
+                raise RuntimeError("bot id missing")
+            member = await app.bot.get_chat_member(config.ADMIN_GROUP_CHAT_ID, bot_id)
+            logging.info(
+                "机器人在管理员群成员状态：status=%s can_manage_topics=%s can_delete_messages=%s",
+                getattr(member, "status", None),
+                getattr(member, "can_manage_topics", None),
+                getattr(member, "can_delete_messages", None),
+            )
+        except (RuntimeError, TelegramError) as e:
+            logging.warning(
+                "无法获取机器人在管理员群成员状态（ADMIN_GROUP_CHAT_ID=%s）：%s",
                 config.ADMIN_GROUP_CHAT_ID,
                 e,
             )
@@ -2925,6 +3057,7 @@ def main() -> None:
         )
     )
     if config.RELAY_MODE == "group_topic" and config.ADMIN_GROUP_CHAT_ID is not None:
+        app.add_handler(TypeHandler(Update, log_group_update), group=-1)
         app.add_handler(
             MessageHandler(
                 filters.UpdateType.EDITED_MESSAGE
@@ -2934,6 +3067,7 @@ def main() -> None:
                 handle_edited_group_admin_message,
             )
         )
+        app.add_handler(TypeHandler(Update, handle_group_topic_channel_update), group=1)
     app.add_handler(
         MessageHandler(
             ~filters.ChatType.PRIVATE & ~filters.COMMAND,
