@@ -32,6 +32,30 @@ MAX_BOT_NAME_LEN = 64
 MAX_BOT_DESCRIPTION_LEN = 512
 MAX_BOT_SHORT_DESCRIPTION_LEN = 120
 PENDING_INPUT_TIMEOUT_SECONDS = 180
+SERVICE_MESSAGE_FIELDS = (
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+    "video_chat_scheduled",
+    "video_chat_started",
+    "video_chat_ended",
+    "video_chat_participants_invited",
+    "new_chat_members",
+    "left_chat_member",
+    "new_chat_title",
+    "new_chat_photo",
+    "delete_chat_photo",
+    "group_chat_created",
+    "supergroup_chat_created",
+    "channel_chat_created",
+    "message_auto_delete_timer_changed",
+    "migrate_to_chat_id",
+    "migrate_from_chat_id",
+    "pinned_message",
+)
 
 
 def utc_now_iso() -> str:
@@ -158,6 +182,10 @@ def message_kind(message) -> str:
     if message.contact:
         return "contact"
     return "other"
+
+
+def is_service_message(message) -> bool:
+    return any(getattr(message, field, None) is not None for field in SERVICE_MESSAGE_FIELDS)
 
 
 def format_ban_info(row: sqlite3.Row) -> str:
@@ -895,7 +923,13 @@ def resolve_target_user_from_group_topic(db: RelayDB, update: Update) -> Optiona
     msg = update.message
     if not msg or msg.message_thread_id is None:
         return None
-    return db.get_user_id_by_topic(config.ADMIN_GROUP_CHAT_ID, int(msg.message_thread_id))
+    thread_id = int(msg.message_thread_id)
+    if (
+        config.ADMIN_GROUP_GENERAL_THREAD_ID is not None
+        and thread_id == config.ADMIN_GROUP_GENERAL_THREAD_ID
+    ):
+        return None
+    return db.get_user_id_by_topic(config.ADMIN_GROUP_CHAT_ID, thread_id)
 
 
 def resolve_target_user_from_arg_or_reply(
@@ -2420,6 +2454,96 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
+async def handle_group_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.message
+    if not msg or not update.effective_chat:
+        return
+    if config.RELAY_MODE != "group_topic" or config.ADMIN_GROUP_CHAT_ID is None:
+        return
+    if update.effective_chat.id != config.ADMIN_GROUP_CHAT_ID:
+        return
+    if is_service_message(msg):
+        return
+
+    db = get_db(context)
+    admin_chat_id = config.ADMIN_GROUP_CHAT_ID
+
+    target_user_id = None
+    if msg.reply_to_message:
+        target_user_id = db.get_target_user_by_admin_message(
+            admin_chat_id, msg.reply_to_message.message_id
+        )
+    if not target_user_id:
+        target_user_id = resolve_target_user_from_group_topic(db, update)
+
+    if not target_user_id:
+        thread_id = msg.message_thread_id
+        db.record_audit_event(
+            event_type="forward_group_topic_to_user",
+            outcome="skipped",
+            admin_chat_id=admin_chat_id,
+            chat_id=admin_chat_id,
+            message_id=msg.message_id,
+            msg_kind=message_kind(msg),
+            direction="admin_to_user",
+            error_code=f"unbound_thread={thread_id}",
+        )
+        if thread_id is not None:
+            await msg.reply_text("当前话题没有绑定用户，消息未转发。")
+        return
+
+    if db.is_user_banned(target_user_id):
+        await msg.reply_text(f"用户 {target_user_id} 已封禁，消息未发送。")
+        return
+
+    try:
+        copied = await context.bot.copy_message(
+            chat_id=target_user_id,
+            from_chat_id=admin_chat_id,
+            message_id=msg.message_id,
+        )
+    except (BadRequest, Forbidden, TelegramError) as e:
+        db.record_audit_event(
+            event_type="forward_group_topic_to_user",
+            outcome="failed",
+            user_id=target_user_id,
+            admin_chat_id=admin_chat_id,
+            chat_id=admin_chat_id,
+            message_id=msg.message_id,
+            msg_kind=message_kind(msg),
+            direction="admin_to_user",
+            error_class=type(e).__name__,
+        )
+        logging.exception(
+            "forward group topic->user failed user=%s chat=%s thread=%s message=%s",
+            target_user_id,
+            admin_chat_id,
+            msg.message_thread_id,
+            msg.message_id,
+        )
+        await msg.reply_text(f"发送失败，用户可能已屏蔽机器人。用户 ID：{target_user_id}")
+        return
+
+    db.save_mapping(
+        user_chat_id=target_user_id,
+        admin_chat_id=admin_chat_id,
+        user_message_id=copied.message_id,
+        admin_message_id=msg.message_id,
+        direction="admin_to_user",
+    )
+    db.record_audit_event(
+        event_type="forward_group_topic_to_user",
+        outcome="success",
+        user_id=target_user_id,
+        admin_chat_id=admin_chat_id,
+        chat_id=admin_chat_id,
+        message_id=msg.message_id,
+        mapped_message_id=copied.message_id,
+        msg_kind=message_kind(msg),
+        direction="admin_to_user",
+    )
+
+
 async def handle_edited_group_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.edited_message
     if not msg or not update.effective_chat:
@@ -2427,8 +2551,6 @@ async def handle_edited_group_admin_message(update: Update, context: ContextType
     if config.RELAY_MODE != "group_topic" or config.ADMIN_GROUP_CHAT_ID is None:
         return
     if update.effective_chat.id != config.ADMIN_GROUP_CHAT_ID:
-        return
-    if not is_admin_user(update):
         return
 
     db = get_db(context)
@@ -2600,7 +2722,7 @@ async def private_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if is_admin_user(update):
             if await consume_pending_input_if_any(update, context):
                 return
-            await handle_admin_message(update, context)
+        await handle_group_topic_message(update, context)
         return
 
     await update.message.reply_text("该机器人仅支持私聊使用。")
@@ -2614,6 +2736,18 @@ def validate_config() -> None:
     if config.RELAY_MODE == "group_topic":
         if config.ADMIN_GROUP_CHAT_ID is None:
             raise RuntimeError("group_topic 模式下必须配置 ADMIN_GROUP_CHAT_ID。")
+
+
+def configure_logging() -> str:
+    log_path = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        level=logging.INFO,
+        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+        force=True,
+    )
+    logging.info("日志文件已创建：%s", log_path)
+    return log_path
 
 
 async def sync_if_changed(
@@ -2744,10 +2878,7 @@ async def setup_bot_profile(app: Application) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        level=logging.INFO,
-    )
+    configure_logging()
     validate_config()
 
     app = Application.builder().token(config.BOT_TOKEN).post_init(setup_bot_profile).build()
