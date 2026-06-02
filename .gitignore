@@ -1,14 +1,11 @@
-﻿# Python cache
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-
-# Virtual env
-.venv/
-venv/
-env/
+﻿# Go build / test output
+dist/
+bin/
+*.exe
+*.test
+*.out
+coverage/
+coverage.out
 
 # Local env config
 .env
